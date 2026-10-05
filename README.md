@@ -36,8 +36,6 @@ tinyjs build    # 打包 dist/todo（本机运行）与 dist/待办中心 · TOD
 - [目录结构](#目录结构)
 - [测试](#测试)
 - [许可证](#许可证)
-- [贡献指南](#贡献指南)
-- [联系方式](#联系方式)
 
 ## 功能特性
 
@@ -181,7 +179,7 @@ tinyjs notarize --dmg         # 提交 Apple 公证并 staple（正式分发必�
   "title": "待办中心 · TODO Studio",
   "size": "1080x720",
   "id": "com.example.todo",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minTinyjsVersion": "0.47.1"
 }
 ```
@@ -192,7 +190,7 @@ tinyjs notarize --dmg         # 提交 Apple 公证并 staple（正式分发必�
 | `title` | `待办中心 · TODO Studio` | 窗口标题、`.app` 名、Dock 名 |
 | `size` | `1080x720` | 初始窗口尺寸（窄于 900px 时前端自动改为上下堆叠布局） |
 | `id` | `com.example.todo` | **分发前请改成你自己的反向域名**：决定数据目录与单实例标识 |
-| `version` | `0.2.2` | 版本号，构建 / 发布 / CHANGELOG 对齐 |
+| `version` | `0.2.3` | 版本号，构建 / 发布 / CHANGELOG 对齐 |
 | `minTinyjsVersion` | `0.47.1` | 低于该版本的 CLI 拒绝运行并给出明确提示，而不是报一堆难懂的错 |
 
 ### 外观模式（主题）
@@ -349,45 +347,6 @@ sips -s format jpeg -s formatOptions 80 /tmp/todo-ui-light.pdf.png --out docs/sc
 
 ## 许可证
 
-本项目以 **MIT License** 开源，版权归 © 2026 Ryanhel —— 完整文本见 [`LICENSE`](LICENSE)。
+本项目以 **MIT License** 开源，完整文本见 [`LICENSE`](LICENSE)。
 你可以自由使用、复制、修改、合并、发布、分发、再许可与销售，只需保留版权声明与许可声明；
 软件按"现状"提供，不含任何形式的担保。
-
-- **框架**：tinyjs 运行时与 CLI 同样是 MIT（© tarwin，仓库 <https://github.com/tarwin/tinyjsapp>），
-  但不随本仓库分发 —— 它们由 `curl -fsSL https://tinyjs.app/install | sh` 装到本机。
-- **随仓库保留的框架文件**：`types/tiny.d.ts`、`types/tjs.d.ts`（API 类型提示，编辑器补全用）。
-- **不跟踪的**：框架自带的 agent skill 文档（`.claude/`、`.agents/`）与构建产物（`dist/`、`.build/`、`tools/build/`）。
-- 想换成别的许可证（Apache-2.0 / GPL / 闭源商业…）改 `LICENSE` 与本段说明即可，
-  README 顶部那行徽标也一并改掉。
-
-## 贡献指南
-
-欢迎 issue 与 PR。为了让改动好合并，麻烦先对齐这几条：
-
-1. **改前跑一次测试，改后再跑一次**：
-
-   ```sh
-   node tools/model.test.js                                                                     # 模型层单测，28 项
-   node tools/build-selftest.js && TINYJS_HTML="$(pwd)/tools/build/selftest.html" tinyjs dev     # 端到端自检，132 项断言
-   ```
-
-   两个都绿再提交；用户可见的行为变化请顺带更新 `CHANGELOG.md`（版本号在 `tinyjs.json` 里同步）。
-2. **提交信息**：语义化前缀 + 中文正文，重点说清"为什么"。
-   `feat:` 新功能 / `fix:` 修缺陷 / `style:` 纯样式 / `test:` 测试 / `docs:` 文档 / `chore:` 杂项。
-   例：`fix: 折叠列表后筛选计数不再重置选中项`。
-3. **代码约定**（都是之前踩过的坑，尽量别退回去）：
-   - 零运行时依赖、无打包步骤：前端就是 `index.html` 里那几个 `<script>`；
-   - 状态只有一份真相（`app.js` 的 `state`），视图只画 DOM 不碰数据，业务规则只写在 `model.js` 的纯函数里；
-   - 样式只引用设计令牌、不写死颜色；动浅色令牌记得跑 `node tools/sync-light-theme.js`；
-   - 新增动作先回答"它的作用域是什么、唯一入口放哪"（见「入口与职责划分（去重方案）」），
-     不要在主区、面板、空态里再放第二个等价按钮；
-   - 任何插进 `innerHTML` 的文本都要转义（`ui.js` 里已有 `esc()`）—— 页面是本地页，但数据可以是任意文本。
-4. **别提交** `dist/`、`.build/`、`tools/build/` 与任何本地数据 / 密钥（`.gitignore` 已经挡住，
-   提交前用 `git status` 再过一眼）。
-
-## 联系方式
-
-- **仓库**：<https://github.com/ryanhel/todo-studio>
-- **Bug 与功能建议**：<https://github.com/ryanhel/todo-studio/issues>
-- **框架本身的问题**（tinyjs / txiki.js）：<https://github.com/tarwin/tinyjsapp> · <https://tinyjs.app>
-- **作者**：Ryanhel（GitHub [@ryanhel](https://github.com/ryanhel)）

@@ -3,6 +3,6 @@
   "title": "待办中心 · TODO Studio",
   "size": "1080x720",
   "id": "com.example.todo",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minTinyjsVersion": "0.47.1"
 }
