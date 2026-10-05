@@ -1,0 +1,70 @@
+# =============================================================================
+# 待办中心 · TODO Studio —— 忽略规则
+# 原则：只提交"人和工具都要看的源码 / 文档 / 素材"，其余（依赖、派生产物、
+#       缓存、日志、本地环境与密钥）一律不入库。本应用零 npm 依赖，
+#       下面几条依赖相关规则是为将来接 Vite 模板留的（如 react-ts 模板）。
+# =============================================================================
+
+# ------------------------------------------------------------------ 依赖
+node_modules/
+.pnpm-store/
+bower_components/
+jspm_packages/
+
+# -------------------------------------------------------- 构建产物 / 派生物
+# tinyjs build 的输出：dist/todo、dist/<Title>.app、dist/launcher、dist/publish/
+dist/
+# tinyjs dev/build 的工作目录（launcher 复制、bridge.js 等生成物）
+.build/
+# 自检页产物：tools/build-selftest.js 内联整份前端生成，属派生物
+tools/build/
+# 其它通用产物
+*.tsbuildinfo
+*.map
+.cache/
+
+# ---------------------------------------------------------------- 运行时数据
+# 应用数据在 ~/Library/Application Support/com.example.todo/（不在仓库里）；
+# 这里只挡手工导出的备份文件
+todo-backup-*.json
+
+# ------------------------------------------------------------ 日志 / 缓存
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.tinyjs/
+
+# ---------------------------------------------------- 本地环境变量与密钥
+# 例如 TINYJS_SIGN_IDENTITY / TINYJS_NOTARY_PROFILE 这类本地发布凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.cer
+secrets/
+*.local
+
+# ------------------------------------------- 编辑器 / macOS 本地环境文件
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --------------------------- 本机 AI / agent 工具文档（默认不跟踪，见下）
+# .claude/ 与 .agents/ 是 tinyjs 脚手架附带的框架 skill 文档：两份内容完全相同，
+# 且会随 tinyjs 版本变旧。要让它们随仓库分发（方便协作者用代理改代码），
+# 删掉下面两行即可 —— 内容本身不含任何密钥。
+.claude/
+.agents/
