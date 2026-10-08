@@ -34,14 +34,26 @@
     items: [],
     categories: [],
     ui: JSON.parse(JSON.stringify(UI_DEFAULTS)),
-    mode: 'view',     // view | add | edit | delete | categories
-    draft: null,      // { mode:'add'|'edit', id, title, values:{title,note,priority,categoryId}, dirty }
+    mode: 'view',     // view | add | edit | delete | categories | settings
+    draft: null,      // { mode:'add'|'edit', id, title, values:{title,note,priority,categoryId,reminder}, dirty }
     errors: {},
     pendingCategoryDelete: null,   // 分类删除的二次确认对象
     categoryError: '',             // 分类表单（新增 / 重命名）的错误文案
     systemDark: true,              // 系统当前是否深色；system 模式据此解析
     env: null,
     store: null,
+    // 提醒与通知
+    settings: { notifications: JSON.parse(JSON.stringify(model.DEFAULT_NOTIFICATIONS)) },
+    permission: { state: 'unknown' },   // granted | denied | undetermined | unsupported | unknown
+    loginItem: null,                    // 登录时自动启动：true / false / null（未知）
+    caps: null,                         // tiny.system.capabilities()（判 notifications 支持）
+    packaged: false,                    // 是否运行在打包后的 .app 里（dev 下 tinyjs 字段是 'dev'）
+    highlightId: null,                  // 刚触发提醒的条目：列表里高亮几秒
+    highlightTimer: null,
+    dueDismissed: false,                // 到点横幅被"知道了"收起的当前会话状态
+    reminderTimer: null,                // 页面侧定时刷新（状态随时间变化）
+    syncTimer: null,                    // 同步防抖
+    reminderFired: 0,                   // 本次会话收到过多少次到点推送
   };
 
   /* -------------------------------------------------------- 状态派生 / 工具 */
@@ -106,6 +118,15 @@
       errors: state.errors,
       pendingCategoryDelete: state.pendingCategoryDelete,
       categoryError: state.categoryError,
+      // 提醒与通知（视图层只读这几个字段）
+      now: Date.now(),
+      highlightId: state.highlightId,
+      dueDismissed: state.dueDismissed,
+      reminderStats: model.reminderStats(state.items, Date.now()),
+      reminderQueue: model.reminderQueue(state.items, Date.now()),
+      notifications: state.settings.notifications,
+      permission: state.permission,
+      loginItem: state.loginItem,
     };
   }
 
@@ -401,6 +422,7 @@
           title: '', note: '', priority: 'normal',
           // 默认分类：优先用"上次用过的分类"，其次默认分类（表单仍可改）
           categoryId: model.resolveCategoryId(state.ui.lastCategoryId, state.categories),
+          reminder: model.reminderForm(null),   // 默认关闭；打开时默认"一小时后"
         },
         dirty: false,
       };
@@ -423,6 +445,7 @@
         values: {
           title: todo.title, note: todo.note, priority: todo.priority,
           categoryId: model.resolveCategoryId(todo.categoryId, state.categories),
+          reminder: model.reminderForm(todo.reminder),   // 已设置的提醒回填到表单
         },
         dirty: false,
       };
@@ -466,6 +489,40 @@
   }
   /* ---------------------------------------------------------- 动作：写数据 */
 
+  /**
+   * 表单里的提醒输入（DOM 是"正在输入"的真相来源，草稿是兜底）：
+   * 摊平成 model.normalizeReminderInput 认识的形状；keepAt 让"已到点的原时间"能原样保存。
+   */
+  function reminderInputFromForm() {
+    const content = ui.refs['panel-content'];
+    const draft = state.draft;
+    const base = (draft && draft.values.reminder) ? draft.values.reminder : model.reminderForm(null);
+    const stored = draft && draft.id ? model.byId(state.items, draft.id) : null;
+    const storedReminder = stored ? stored.reminder : null;
+
+    function node(field) { return content.querySelector('[data-field="' + field + '"]'); }
+    const on = node('reminderEnabled');
+    const at = node('reminderAt');
+    const advance = node('reminderAdvance');
+    const repeat = node('reminderRepeat');
+    const endType = node('reminderEndType');
+    const endCount = node('reminderEndCount');
+    const endDate = node('reminderEndDate');
+    const onDone = node('reminderOnDone');
+
+    return {
+      enabled: on ? !!on.checked : !!base.enabled,
+      atText: at ? at.value : base.atText,
+      advance: advance ? Number(advance.value) : base.advance,
+      repeat: repeat ? repeat.value : base.repeat,
+      endType: endType ? endType.value : base.endType,
+      endCount: endCount ? Number(endCount.value) : base.endCount,
+      endDateText: endDate ? endDate.value : base.endDateText,
+      onDone: onDone ? onDone.value : base.onDone,
+      keepAt: storedReminder ? storedReminder.at : null,
+    };
+  }
+
   /** 表单值是"正在输入"的真相来源：优先读 DOM，其次读草稿 */
   function readFormValues() {
     const content = ui.refs['panel-content'];
@@ -479,6 +536,7 @@
       note: noteNode ? noteNode.value : fallback.note,
       priority: state.draft ? state.draft.values.priority : 'normal',
       categoryId: state.draft ? state.draft.values.categoryId : '',
+      reminder: reminderInputFromForm(),
     };
   }
 
@@ -503,8 +561,21 @@
     function remember(result) {
       state.ui.lastCategoryId = result.categoryId;
       persistUi();
+      scheduleReminderSync();          // 表单里可能开了 / 改了 / 关掉了提醒
       const category = model.categoryById(state.categories, result.categoryId);
       return category ? '（' + category.name + '）' : '';
+    }
+
+    /** 保存提示里顺带说明提醒状态：设上了 / 已提醒过 / 已结束 / 什么时间弹 */
+    function reminderSuffix(todo) {
+      if (!todo.reminder) return '';
+      const state = model.reminderState(todo.reminder, Date.now());
+      if (state.key === 'done' || state.key === 'ended' || state.key === 'off') {
+        return ' · 提醒' + state.label + (state.detail ? '（' + state.detail + '）' : '');
+      }
+      return ' · 提醒 ' + model.reminderTiming(todo.reminder, Date.now()) +
+        (todo.reminder.repeat !== 'none' ? '（' + model.reminderRepeatText(todo.reminder) + '）'
+          : (todo.reminder.advance ? '（' + model.reminderAdvanceText(todo.reminder) + '）' : ''));
     }
 
     if (state.mode === 'edit' && state.draft && state.draft.id) {
@@ -522,7 +593,8 @@
       state.draft = null;
       state.mode = 'view';
       render();
-      await persistItems('已保存修改：' + result.todo.title + suffix);
+      await persistItems('已保存修改：' + result.todo.title + suffix + reminderSuffix(result.todo));
+      ensureNotifyPermission(result.todo);
       return true;
     }
 
@@ -534,7 +606,8 @@
     state.draft = null;
     state.mode = 'view';
     render();
-    await persistItems('已创建：' + created.todo.title + suffix);
+    await persistItems('已创建：' + created.todo.title + suffix + reminderSuffix(created.todo));
+    ensureNotifyPermission(created.todo);
     return true;
   }
   async function confirmDelete(id) {
@@ -551,19 +624,39 @@
     delete state.ui.expanded[todo.id];
     state.mode = 'view';
     render();
+    scheduleReminderSync();      // 条目没了，它的日程也要从后端撤掉
     await persistItems('已删除：' + todo.title);
     return true;
   }
 
+  /**
+   * 勾选完成 / 恢复未完成。提醒的处置在模型层按 reminder.onDone 决定：
+   *   cancel（默认）→ 关闭提醒（详情里显示"已取消（完成时自动取消）"）
+   *   keep          → 保留（重复提醒继续走）
+   * 恢复为未完成时，把"因完成而取消、时间还没到"的提醒自动打开。
+   */
   async function toggleStatus(id) {
     const todo = model.byId(state.items, id || state.ui.selectedId);
-    if (!todo) return;
+    if (!todo) return false;
+    const wasActive = model.reminderActive(todo.reminder);
     const next = model.setStatus(todo, todo.status === 'done' ? 'open' : 'done');
     state.items = model.replace(state.items, next);
     render();
-    await persistItems(next.status === 'done'
-      ? '已完成：' + next.title
-      : '已恢复为未完成：' + next.title);
+
+    let note = '';
+    if (wasActive && !model.reminderActive(next.reminder) && next.reminder) {
+      note = next.reminder.cancelReason === 'done' ? '（提醒已结束）' : '（提醒已结束：重复走完）';
+    } else if (wasActive) {
+      note = '（提醒保留：完成后仍会提醒）';
+    } else if (!wasActive && model.reminderActive(next.reminder)) {
+      note = '（提醒已恢复）';
+    }
+
+    scheduleReminderSync();
+    const ok = await persistItems(next.status === 'done'
+      ? '已完成：' + next.title + note
+      : '已恢复为未完成：' + next.title + note);
+    return ok;
   }
 
   /** 导出备份：后端写文件到应用数据目录，并在访达中定位 */
@@ -614,16 +707,75 @@
     ui.renderBanner(view());
   }
 
+  /**
+   * 把表单里的一格提醒输入写进草稿（返回 false 表示不是提醒字段）。
+   * 结构变化由调用方决定要不要重绘：输入过程中不重绘（见 onInput）。
+   */
+  function applyReminderField(field, value) {
+    const draft = state.draft;
+    if (!draft) return false;
+    const current = draft.values.reminder || model.reminderForm(null);
+    const next = Object.assign({}, current);
+
+    if (field === 'reminderEnabled') {
+      next.enabled = !!value;
+      if (next.enabled && !next.atText) next.atText = next.defaultAtText;
+    } else if (field === 'reminderAt') next.atText = String(value || '');
+    else if (field === 'reminderAdvance') next.advance = Number(value);
+    else if (field === 'reminderRepeat') {
+      next.repeat = model.REMINDER_REPEATS.indexOf(String(value)) >= 0 ? String(value) : 'none';
+      if (next.repeat === 'none') {
+        next.endType = 'never'; next.endCount = null; next.endDate = null; next.endDateText = '';
+      } else if (next.endType === 'count' && !next.endCount) {
+        next.endCount = 5;
+      }
+    } else if (field === 'reminderEndType') {
+      next.endType = model.REMINDER_ENDS.indexOf(String(value)) >= 0 ? String(value) : 'never';
+      if (next.endType === 'count' && !next.endCount) next.endCount = 5;
+      if (next.endType === 'date' && !next.endDateText) {
+        const base = next.at || Date.now();
+        next.endDateText = model.toLocalInput(base + 7 * model.DAY_MS).slice(0, 10);
+      }
+    } else if (field === 'reminderEndCount') {
+      const count = Number(value);
+      next.endCount = Number.isFinite(count) && count > 0
+        ? Math.min(Math.floor(count), model.REMINDER_LIMIT.count) : null;
+    } else if (field === 'reminderEndDate') next.endDateText = String(value || '');
+    else if (field === 'reminderOnDone') next.onDone = String(value) === 'keep' ? 'keep' : 'cancel';
+    else return false;
+
+    draft.values.reminder = next;
+    if (!draft.dirty) draft.dirty = true;
+    return true;
+  }
+
+  /** 只刷新"到点提醒：…"那行确认文案（输入过程中不整树重绘，光标不跳） */
+  function refreshReminderPreview() {
+    const node = ui.refs['panel-content'].querySelector('#reminder-preview');
+    if (!node || !state.draft) return;
+    node.textContent = ui.reminderPreviewText(state.draft.values);
+  }
+
   /** 输入事件：只更新草稿与计数器 —— 不重绘，中文输入法合成过程不受打扰 */
   function onInput(ev) {
-    const field = ev.target && ev.target.dataset ? ev.target.dataset.field : null;
+    const target = ev.target;
+    const field = target && target.dataset ? target.dataset.field : null;
     if (!field || !state.draft) return;
 
-    state.draft.values[field] = ev.target.value;
+    // 提醒字段：值进草稿的 reminder（datetime / number 输入过程中不重绘）
+    if (field.indexOf('reminder') === 0 && field !== 'reminderEnabled') {
+      if (applyReminderField(field, target.value)) {
+        refreshReminderPreview();
+        setDirtyIndicator();
+      }
+      return;
+    }
+
+    state.draft.values[field] = target.value;
     if (!state.draft.dirty) state.draft.dirty = true;
 
     const isTitle = field === 'title';
-    setCounter(isTitle ? 'f-title' : 'f-note', ev.target.value.length,
+    setCounter(isTitle ? 'f-title' : 'f-note', target.value.length,
       isTitle ? model.LIMIT.title : model.LIMIT.note);
     setDirtyIndicator();
   }
@@ -648,6 +800,11 @@
       state.categoryError = '';
       state.pendingCategoryDelete = null;
       render();
+    } else if (mode === 'settings') {
+      state.mode = 'settings';
+      render();
+      refreshPermission().then(render);   // 打开设置页时重新问一次系统状态
+      refreshLoginItem().then(render);
     } else if (mode === 'view') {
       state.mode = 'view';
       render();
@@ -696,6 +853,25 @@
     'ask-delete-category': function (action) { askDeleteCategory(action.value); },
     'confirm-delete-category': function (action) { confirmDeleteCategory(action.value); },
     'cancel-delete-category': function () { cancelDeleteCategory(); },
+    // 提醒与通知
+    'remind-open': function (action) { openReminder(action.id); },
+    'remind-cancel': function (action) { cancelReminder(action.id); },
+    'remind-snooze': function (action) { snoozeReminder(action.id, 10); },
+    'remind-dismiss': function () { state.dueDismissed = true; render(); },
+    'request-permission': function () { requestPermission(); },
+    'check-permission': function () {
+      refreshPermission().then(function (status) {
+        render();
+        ui.toast('info', '通知权限：' + status);
+      });
+    },
+    'open-notification-settings': function () { openNotificationSettings(); },
+    'notify-test': function () { sendTestNotification(); },
+    'toggle-notify': function () { toggleNotifySwitch('enabled'); },
+    'toggle-sound': function () { toggleNotifySwitch('sound'); },
+    'toggle-dnd': function () { toggleNotifySwitch('dndEnabled'); },
+    'toggle-catchup': function () { toggleNotifySwitch('catchUp'); },
+    'toggle-autostart': function () { toggleAutoStart(); },
     // 'save' 不在这里处理：交给表单的 submit 事件，避免一次点击执行两遍
   };
 
@@ -752,14 +928,17 @@
 
     // 页面内快捷键：没有原生菜单（浏览器预览）时同样可用
     if (ev.metaKey || ev.ctrlKey) {
-      const shortcuts = { n: 'new', e: 'edit', d: 'delete', l: 'toggle-list' };
+      const shortcuts = {
+        n: function () { startAdd(); },
+        e: function () { startEdit(); },
+        d: function () { askDelete(); },
+        l: function () { toggleList(); },
+        ',': function () { setMode('settings'); },   // 与菜单栏「通知设置…」一致
+      };
       const action = shortcuts[String(key).toLowerCase()];
       if (!action) return;
       ev.preventDefault();
-      if (action === 'new') startAdd();
-      else if (action === 'edit') startEdit();
-      else if (action === 'delete') askDelete();
-      else toggleList();
+      action();
     }
   }
 
@@ -781,12 +960,389 @@
     }
   }
 
-  /** 分类改名走 change（回车或失焦）提交，避免每敲一个字就写一次盘 */
+  /**
+   * change 事件：分类改名（回车 / 失焦提交）、提醒字段（下拉 / 勾选 / 日期）、
+   * 通知设置里的免打扰时间。提醒字段在这里才重绘 —— 结构可能变（开启开关、换重复规则）。
+   */
   function onChange(ev) {
     const target = ev.target;
-    const id = target && target.dataset ? target.dataset.catRename : null;
-    if (!id) return;
-    renameCategory(id, target.value);
+    const dataset = target && target.dataset ? target.dataset : null;
+    if (!dataset) return;
+
+    if (dataset.catRename) {
+      renameCategory(dataset.catRename, target.value);
+      return;
+    }
+
+    if (dataset.field === 'notifyDndFrom' || dataset.field === 'notifyDndTo') {
+      setDndTime(dataset.field, target.value);
+      return;
+    }
+
+    if (dataset.field && dataset.field.indexOf('reminder') === 0 && state.draft) {
+      const value = target.type === 'checkbox' ? !!target.checked : target.value;
+      if (applyReminderField(dataset.field, value)) {
+        render();
+        setDirtyIndicator();
+      }
+    }
+  }
+
+  /* ------------------------------------------------------ 提醒：数据与同步 */
+
+  /** 给后端的通知选项（总开关 / 提示音 / 免打扰 / 补发） */
+  function notifyOptions() {
+    return Object.assign({}, state.settings.notifications);
+  }
+
+  /** 一条待办 → 后端日程条目（分类名在这里查，后端没有分类表） */
+  function reminderEntry(todo) {
+    const reminder = todo.reminder;
+    if (!model.reminderActive(reminder)) return null;   // 未开启 / 已取消的不排期
+    const category = model.categoryById(state.categories, todo.categoryId);
+    return {
+      id: todo.id,
+      title: todo.title,
+      category: category ? category.name : '未分类',
+      at: reminder.at,
+      advance: reminder.advance,
+      repeat: reminder.repeat,
+      endType: reminder.endType,
+      endCount: reminder.endCount,
+      endDate: reminder.endDate,
+      onDone: reminder.onDone,
+      enabled: true,
+      firedCount: reminder.firedCount || 0,
+      lastFiredAt: reminder.lastFiredAt || null,
+    };
+  }
+
+  /** 同步防抖：连续操作（批量改数据 / 切开关）只推一次 */
+  function scheduleReminderSync() {
+    if (state.syncTimer) clearTimeout(state.syncTimer);
+    state.syncTimer = setTimeout(function () {
+      state.syncTimer = null;
+      syncReminders();
+    }, 120);
+  }
+
+  /** 把当前所有"活的"提醒整体推给后端，并用返回的日程回写条目 */
+  async function syncReminders() {
+    const list = state.items.map(reminderEntry).filter(Boolean);
+    const result = await bridge.syncReminders(list, notifyOptions());
+    if (result && Array.isArray(result.entries)) applySchedule(result.entries);
+    return result;
+  }
+
+  /**
+   * 后端是"下一轮排在哪 / 送没送过"的权威：把它推进过的提醒时间与台账写回条目。
+   * 只在值真的变了时写 —— 既不和用户正在编辑的草稿打架，也不做无谓落盘。
+   */
+  function applySchedule(entries) {
+    let changed = false;
+    entries.forEach(function (entry) {
+      const todo = model.byId(state.items, entry.id);
+      const current = todo ? todo.reminder : null;
+      const next = model.sanitizeReminder(entry.reminder);
+      if (!todo || !next || !current) return;
+      const same = current.at === next.at && current.lastFiredAt === next.lastFiredAt &&
+        current.firedCount === next.firedCount && current.enabled === next.enabled &&
+        current.cancelReason === next.cancelReason;
+      if (same) return;
+      state.items = model.replace(state.items, Object.assign({}, todo, { reminder: next }));
+      changed = true;
+    });
+    if (changed) {
+      render();
+      persistItems();
+    }
+  }
+
+  /* ------------------------------------------------------ 提醒：交互与事件 */
+
+  /** 高亮 6 秒后自动褪去（列表里的 is-reminding / 视觉标识） */
+  function highlight(id) {
+    state.highlightId = id;
+    if (state.highlightTimer) clearTimeout(state.highlightTimer);
+    state.highlightTimer = setTimeout(function () {
+      state.highlightId = null;
+      state.highlightTimer = null;
+      render();
+    }, 6000);
+  }
+
+  /** 点系统通知 / 应用内横幅：把窗口拉到前台 → 选中 → 高亮 → 滚动到可见 */
+  async function openReminder(id) {
+    const todo = model.byId(state.items, id);
+    if (!todo) {
+      ui.toast('info', '这条待办已不存在（提醒已忽略）');
+      return false;
+    }
+    await bridge.focusWindow();
+    state.ui.selectedId = todo.id;
+    state.mode = 'view';
+    state.dueDismissed = true;
+    highlight(todo.id);
+    render();
+    persistUi();
+    const node = ui.refs.groups.querySelector('[data-id="' + todo.id + '"]');
+    if (node && node.scrollIntoView) node.scrollIntoView({ block: 'center' });
+    return true;
+  }
+
+  /** 后端推来的到点事件：写回台账 → 应用内提示 → 高亮 */
+  function handleReminderDue(payload) {
+    if (!payload || !payload.id) return;
+    const todo = model.byId(state.items, payload.id);
+    state.reminderFired++;
+
+    if (todo && payload.reminder) {
+      const next = model.sanitizeReminder(payload.reminder);
+      if (next) {
+        state.items = model.replace(state.items, Object.assign({}, todo, { reminder: next }));
+        persistItems();
+        // 后端推的是"推进之后"的日程（含重复提醒的下一轮时间）：回同步一次让两边对齐
+        scheduleReminderSync();
+      }
+    }
+
+    const title = todo ? todo.title : (payload.title || '待办');
+    const when = payload.reminder ? model.reminderTiming(payload.reminder, Date.now()) : '';
+    const late = payload.late ? '（补发：应用没运行时到点）' : '';
+    ui.toast('info', '⏰ 提醒到点：' + title + (when ? ' · ' + when : '') + late, { duration: 6000 });
+    if (todo) highlight(todo.id);
+    state.dueDismissed = false;
+    render();
+  }
+
+  /** 取消提醒：关闭但保留设置（详情里能看到"已取消（用户取消）"） */
+  async function cancelReminder(id, silent) {
+    const todo = model.byId(state.items, id || state.ui.selectedId);
+    if (!todo || !todo.reminder) {
+      if (!silent) ui.toast('info', '这条待办没有提醒可取消');
+      return false;
+    }
+    const next = model.cancelReminder(todo.reminder, Date.now(), 'user');
+    state.items = model.replace(state.items, Object.assign({}, todo, { reminder: next }));
+    render();
+    const ok = await persistItems();
+    scheduleReminderSync();
+    if (ok && !silent) ui.toast('info', '已取消「' + todo.title + '」的提醒（设置保留，编辑里可重开）');
+    return ok;
+  }
+
+  /**
+   * 稍后提醒：把提醒时间推到 N 分钟后（提前量归零，否则新的时间又立刻落回"该弹了"）。
+   * 重复提醒沿用同一条规则：本次之后按新时间继续走。
+   */
+  async function snoozeReminder(id, minutes) {
+    const todo = model.byId(state.items, id || state.ui.selectedId);
+    if (!todo || !todo.reminder) {
+      ui.toast('info', '这条待办没有提醒可推迟');
+      return false;
+    }
+    const gap = Number.isFinite(minutes) ? minutes : 10;
+    const next = Object.assign({}, todo.reminder, {
+      enabled: true, at: Date.now() + gap * 60000, advance: 0, lastFiredAt: null,
+      cancelledAt: null, cancelReason: null,
+    });
+    state.items = model.replace(state.items, Object.assign({}, todo, { reminder: next }));
+    render();
+    const ok = await persistItems();
+    scheduleReminderSync();
+    if (ok) {
+      ui.toast('success', '已推迟 ' + gap + ' 分钟：' + todo.title +
+        (next.repeat !== 'none' ? '（重复提醒以新时间为基准继续）' : ''));
+    }
+    return ok;
+  }
+
+  /* ---------------------------------------------------- 通知：权限与设置 */
+
+  async function refreshPermission() {
+    if (!bridge.available) {
+      state.permission = { state: 'unsupported' };
+      return state.permission.state;
+    }
+    const status = await bridge.notifyPermission();
+    const capped = (state.caps && state.caps.notifications === false) ? 'unsupported' : status;
+    state.permission = { state: capped || 'unknown' };
+    return state.permission.state;
+  }
+
+  async function refreshLoginItem() {
+    const status = await bridge.loginItem();
+    state.loginItem = status || null;
+    return status;
+  }
+
+  async function requestPermission() {
+    const status = await bridge.requestNotifyPermission();
+    await refreshPermission();
+    render();
+    if (status === 'granted') ui.toast('success', '通知已授权：到点会弹系统横幅');
+    else if (status === 'denied') ui.toast('error', '通知被拒绝：可在系统设置 → 通知里重新打开');
+    else ui.toast('info', '权限状态：' + status);
+    return status;
+  }
+
+  async function openNotificationSettings() {
+    const ok = await bridge.openNotificationSettings();
+    ui.toast('info', ok
+      ? '已尝试打开系统「通知」设置页：找到「' + NS.const.APP_NAME + '」并允许通知'
+      : '请手动打开：系统设置 → 通知 → 「' + NS.const.APP_NAME + '」');
+    return ok;
+  }
+
+  async function sendTestNotification() {
+    const ok = await bridge.testNotify(NS.const.APP_NAME, '这是一条测试通知：到点时会这样提醒你。');
+    ui.toast(ok ? 'success' : 'error', ok
+      ? '已发送测试通知（没看到横幅就检查系统通知权限与专注模式）'
+      : '测试通知发送失败：可能未授权、被免打扰挡下，或当前环境不支持');
+    return ok;
+  }
+
+  /**
+   * 第一次真正用上提醒（保存表单时带着"开启的提醒"）才请求通知权限：
+   * 有上下文、说明用途，不是一上来就弹系统对话框。
+   * 只在**打包后的 .app** 里请求 —— dev 下 macOS 没有 bundle，通知只会回落到 osascript，
+   * 这时候弹授权框没有意义（设置页里会写明）。
+   */
+  async function ensureNotifyPermission(todo) {
+    if (!todo || !todo.reminder || todo.reminder.enabled !== true) return null;
+    if (!bridge.available || !state.packaged) return null;
+    if (state.permission.state !== 'undetermined') return state.permission.state;
+    ui.toast('info', '第一次用提醒：先向系统申请通知权限，允许后到点才会弹横幅', { duration: 4200 });
+    return requestPermission();
+  }
+
+  /** 通知设置：改一项 → 归一化 → 落盘 → 同步给后端（由后端决定弹不弹） */
+  async function updateNotifications(patch, message) {
+    state.settings.notifications = model.sanitizeNotifications(
+      Object.assign({}, state.settings.notifications, patch));
+    render();
+    await state.store.saveSettings(state.settings);
+    scheduleReminderSync();
+    if (message) ui.toast('info', message);
+    return state.settings.notifications;
+  }
+
+  async function toggleNotifySwitch(key) {
+    const current = state.settings.notifications;
+    if (key === 'enabled') {
+      return updateNotifications({ enabled: !current.enabled },
+        current.enabled ? '系统通知已关闭（应用内提示照旧）' : '系统通知已开启');
+    }
+    if (key === 'sound') {
+      return updateNotifications({ sound: !current.sound },
+        current.sound ? '提示音已关闭' : '提示音已开启');
+    }
+    if (key === 'dndEnabled') {
+      return updateNotifications({ dndEnabled: !current.dndEnabled },
+        current.dndEnabled ? '免打扰已关闭' : '免打扰已开启：' + model.quietHoursText(current));
+    }
+    if (key === 'catchUp') {
+      return updateNotifications({ catchUp: !current.catchUp },
+        current.catchUp ? '错过的提醒不再补发' : '错过的提醒会在下次打开时补发');
+    }
+    return current;
+  }
+
+  /** 免打扰时间（两个 time 输入框，change 时落盘） */
+  async function setDndTime(field, value) {
+    if (!/^\d{2}:\d{2}$/.test(String(value || ''))) return false;
+    const patch = {};
+    patch[field === 'notifyDndTo' ? 'dndTo' : 'dndFrom'] = value;
+    await updateNotifications(patch, '免打扰时段：' + model.quietHoursText(
+      Object.assign({}, state.settings.notifications, patch)));
+    return true;
+  }
+
+  /** 登录时自动启动：让应用常驻，"应用没打开"也能按时提醒 */
+  async function toggleAutoStart() {
+    const status = await bridge.setLoginItem(state.loginItem !== 'enabled');
+    state.loginItem = status || null;
+    render();
+    if (!status || status === 'unsupported') {
+      ui.toast('error', '当前环境不支持设置登录项（需要打包后的 .app）');
+      return status;
+    }
+    if (status === 'requires-approval') {
+      ui.toast('info', '已登记登录项：需要你在「系统设置 → 通用 → 登录项」里允许');
+      return status;
+    }
+    ui.toast(status === 'enabled' ? 'success' : 'info',
+      status === 'enabled' ? '已开启登录时自动启动' : '已关闭登录时自动启动');
+    return status;
+  }
+
+  /* ---------------------------------------------------------- 提醒：定时 */
+
+  /** 提醒状态随时间变化（已设置 → 即将到期 → 已过期），用轻量签名决定要不要重绘 */
+  function reminderSignature() {
+    const now = Date.now();
+    return state.items.map(function (todo) {
+      return todo.id + ':' + (todo.reminder ? model.reminderState(todo.reminder, now).key : '-');
+    }).join('|');
+  }
+
+  function startReminderClock() {
+    if (state.reminderTimer) clearInterval(state.reminderTimer);
+    state.reminderSignature = reminderSignature();
+    state.reminderTimer = setInterval(function () {
+      const next = reminderSignature();
+      if (next !== state.reminderSignature) {
+        state.reminderSignature = next;
+        render();                                  // 只有跨过阈值（16:00 → 17:00 这类）才重绘
+      }
+      if (!bridge.available) checkDueInPage();     // 浏览器预览：页面自己兜底
+    }, 20000);
+  }
+
+  /**
+   * 浏览器预览（没有后端定时器）时的兜底：页面自己发现"到点但没提示过"的提醒，
+   * 走应用内提示 + 浏览器的 Notification（如果被允许过）。
+   */
+  async function checkDueInPage() {
+    const now = Date.now();
+    const due = state.items.filter(function (todo) { return model.reminderPending(todo.reminder, now); });
+    if (!due.length) return 0;
+
+    due.forEach(function (todo) {
+      const advanced = model.advanceReminder(todo.reminder, now);
+      state.items = model.replace(state.items, Object.assign({}, todo, { reminder: advanced }));
+      ui.toast('info', '⏰ 提醒到点：' + todo.title, { duration: 6000 });
+      try {
+        const web = root.Notification;
+        if (web && web.permission === 'granted') new web('⏰ ' + todo.title, { body: '待办中心 · 提醒' });
+      } catch (_e) { /* 浏览器不支持就算了：应用内提示已经有了 */ }
+    });
+
+    render();
+    await persistItems();
+    return due.length;
+  }
+
+  /** 启动提醒链路：先订阅推送（后端补发可能就发生在同步那一步），再首次同步 */
+  function setupReminders() {
+    bridge.onReminderDue(handleReminderDue);
+    bridge.onNotifyClick(function (id) { openReminder(id); });
+    startReminderClock();
+
+    refreshPermission().then(render);
+    refreshLoginItem().then(render);
+    bridge.appInfo().then(function (info) {
+      state.packaged = !!(info && info.tinyjs && info.tinyjs !== 'dev');
+    });
+    bridge.capabilities().then(function (caps) {
+      state.caps = caps || null;
+      if (caps && caps.notifications === false) {
+        state.permission = { state: 'unsupported' };
+        render();
+      }
+    });
+
+    scheduleReminderSync();
   }
 
   /* ------------------------------------------------------ 原生菜单（tinyjs） */
@@ -800,6 +1356,7 @@
       { separator: true },
       { id: 'menu-toggle-list', label: '折叠 / 展开列表', key: 'l' },
       { id: 'menu-categories', label: '分类管理…', key: 'k' },
+      { id: 'menu-settings', label: '通知设置…', key: ',' },
       { separator: true },
       { id: 'menu-theme-toggle', label: '切换外观', key: 't' },
       { id: 'menu-theme-system', label: '外观：跟随系统' },
@@ -828,6 +1385,7 @@
       else if (id === 'menu-delete') askDelete();
       else if (id === 'menu-toggle-list') toggleList();
       else if (id === 'menu-categories') setMode('categories');
+      else if (id === 'menu-settings') setMode('settings');
       else if (id === 'menu-theme-toggle') toggleTheme();
       else if (id === 'menu-theme-system') setThemeMode('system');
       else if (id === 'menu-export') exportBackup();
@@ -863,6 +1421,7 @@
     state.items = await state.store.loadItems();
     state.categories = await state.store.loadCategories();
     state.ui = sanitizeUi(await state.store.loadUi());
+    state.settings = await state.store.loadSettings();
 
     // 兜底：条目上缺失 / 已失效的分类统一落到默认分类
     state.items = model.assignCategories(state.items, state.categories);
@@ -880,6 +1439,7 @@
     render();
     bindEvents();
     setupMenu();
+    setupReminders();          // 订阅到点推送 + 首次把提醒日程同步给后端
 
     state.env = await bridge.info();
     ui.renderEnv(state.env);
@@ -908,6 +1468,15 @@
     resumeDraft: resumeDraft, discardDraft: discardDraft, cancelCurrent: cancelCurrent,
     readFormValues: readFormValues, saveForm: saveForm,
     confirmDelete: confirmDelete, toggleStatus: toggleStatus, exportBackup: exportBackup,
+    // 提醒与通知（自检脚本可驱动同一套逻辑）
+    reminderEntry: reminderEntry, syncReminders: syncReminders, applySchedule: applySchedule,
+    handleReminderDue: handleReminderDue, openReminder: openReminder, highlight: highlight,
+    cancelReminder: cancelReminder, snoozeReminder: snoozeReminder,
+    updateNotifications: updateNotifications, toggleNotifySwitch: toggleNotifySwitch,
+    refreshPermission: refreshPermission, requestPermission: requestPermission,
+    sendTestNotification: sendTestNotification, toggleAutoStart: toggleAutoStart,
+    setDndTime: setDndTime, checkDueInPage: checkDueInPage, ensureNotifyPermission: ensureNotifyPermission,
+    applyReminderField: applyReminderField, reminderInputFromForm: reminderInputFromForm,
     // 外观
     setThemeMode: setThemeMode, toggleTheme: toggleTheme, applyTheme: applyTheme,
     handleSystemTheme: function (dark) { state.systemDark = !!dark; state.ui.themeMode = 'system'; applyTheme(); render(); },

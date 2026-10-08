@@ -27,6 +27,7 @@
   const ITEMS_KEY = 'todo.items.v1';
   const CATS_KEY = 'todo.categories.v1';
   const UI_KEY = 'todo.ui.v1';
+  const SETTINGS_KEY = 'todo.settings.v1';   // 自检会改通知设置，必须一起重置，否则跨轮次互相干扰
 
   const results = [];
   const pageErrors = [];
@@ -77,6 +78,18 @@
     return $$('.toast-' + kind).some((n) => n.textContent.indexOf(contains) >= 0);
   }
 
+  /** 取某条待办的提醒芯片（按标题定位 —— 列表里可能同时有好几个芯片） */
+  function chipOf(title) {
+    const items = $$('.item');
+    for (let i = 0; i < items.length; i++) {
+      const label = items[i].querySelector('.item-title');
+      if (!label || label.textContent.trim() !== title) continue;
+      const chip = items[i].querySelector('.remind-chip');
+      return chip ? { cls: chip.className, text: chip.textContent.trim(), node: chip } : null;
+    }
+    return null;
+  }
+
   function click(target) {
     const node = typeof target === 'string' ? $(target) : target;
     if (!node) throw new Error('click: 未找到 ' + target);
@@ -105,6 +118,15 @@
     if (!input) throw new Error('rename: 未找到分类输入框 ' + catId);
     input.value = name;
     input.dispatchEvent(new root.Event('change', { bubbles: true }));
+  }
+
+  /** 给输入 / 下拉赋值：同时派发 input 与 change（表单两种路径都要走到） */
+  function setValue(sel, value) {
+    const node = $(sel);
+    if (!node) throw new Error('setValue: 未找到 ' + sel);
+    node.value = value;
+    node.dispatchEvent(new root.Event('input', { bubbles: true }));
+    node.dispatchEvent(new root.Event('change', { bubbles: true }));
   }
 
   function press(key) {
@@ -145,6 +167,7 @@
       await root.tiny.store.delete(ITEMS_KEY);
       await root.tiny.store.delete(CATS_KEY);
       await root.tiny.store.delete(UI_KEY);
+      await root.tiny.store.delete(SETTINGS_KEY);
       say('SELFTEST 检测到残留数据，清空后重跑 phase1（第 ' + (attempts + 1) + ' 次）');
       await sleep(220);
       root.location.reload();
@@ -471,6 +494,236 @@
     check('每条待办都挂在存在的分类上',
       ctl.state.items.every((t) => !!model.categoryById(ctl.state.categories, t.categoryId)));
 
+    /* 16) 提醒：表单 → 列表/详情标识 → 校验 → 到点 → 完成处置 → 取消 / 稍后 */
+    say('SELFTEST phase1：提醒与通知设置');
+
+    ctl.startAdd();
+    type('#f-title', '提交报销单');
+    click('[data-act="set-category"][data-value="cat-work"]');
+
+    check('新建表单默认不设提醒', !$('#f-remind-on').checked);
+    check('未开启时不渲染提醒控件', !$('#f-remind-at'));
+
+    click('#f-remind-on');
+    await sleep(130);
+    check('开启提醒后出现时间 / 提前量 / 重复控件',
+      !!$('#f-remind-at') && !!$('#f-remind-advance') && !!$('#f-remind-repeat'));
+    check('提醒时间默认预填"一小时后"', ($('#f-remind-at').value || '').length >= 16,
+      $('#f-remind-at').value);
+
+    const remindAt = Date.now() + 3 * 60 * 60 * 1000;
+    setValue('#f-remind-at', model.toLocalInput(remindAt));
+    setValue('#f-remind-advance', '5');
+    setValue('#f-remind-repeat', 'daily');
+    await sleep(140);
+    check('选了重复才出现结束条件', !!$('#f-remind-end'));
+    setValue('#f-remind-end', 'count');
+    await sleep(140);
+    setValue('#f-remind-count', '3');
+    check('确认文案反映当前设置', text('#reminder-preview').indexOf('提前 5 分钟') >= 0,
+      text('#reminder-preview'));
+
+    await ctl.saveForm();
+    await sleep(160);
+    const reminded = byTitle('提交报销单');
+    check('提醒随创建一起保存', !!reminded && !!reminded.reminder,
+      JSON.stringify(reminded && reminded.reminder));
+    equal('提醒时间入库', reminded.reminder.at, model.fromLocalInput(model.toLocalInput(remindAt)));
+    equal('提前量入库', reminded.reminder.advance, 5);
+    equal('重复规则入库', reminded.reminder.repeat, 'daily');
+    equal('结束条件入库', reminded.reminder.endCount, 3);
+
+    const remindedChip = chipOf('提交报销单');
+    check('列表里出现提醒芯片', !!remindedChip);
+    check('芯片带"已设置"状态类', !!remindedChip && /is-scheduled/.test(remindedChip.cls),
+      remindedChip ? remindedChip.cls : '（没有芯片）');
+    check('芯片文案含⏰与重复标记',
+      !!remindedChip && remindedChip.text.indexOf('\u23f0') >= 0 && remindedChip.text.indexOf('\u21bb') >= 0,
+      remindedChip ? remindedChip.text : '（没有芯片）');
+
+    ctl.select(reminded.id);
+    await sleep(140);
+    check('详情面板有提醒块', !!$('#panel-view .remind-block'));
+    equal('详情里显示"已设置"', text('.remind-block .rb-state'), '已设置');
+    check('详情里显示重复说明', text('.remind-block .rb-main').indexOf('每天') >= 0,
+      text('.remind-block .rb-main'));
+
+    /* 校验：过去的时间要被拦下，且不覆盖已保存的提醒 */
+    ctl.startEdit(reminded.id);
+    await sleep(140);
+    setValue('#f-remind-at', model.toLocalInput(Date.now() - 60 * 60 * 1000));
+    await ctl.saveForm();
+    await sleep(140);
+    check('过去的时间被拦下并提示', hasToast('error', '已经过去'), toastInfo());
+    equal('被拦下时原提醒时间不变', byTitle('提交报销单').reminder.at, reminded.reminder.at);
+
+    ctl.cancelCurrent();
+    await sleep(120);
+
+    /* 到点推送（真实流程由后端定时器发起，这里喂同一份 payload）。
+       这条是「每天 · 共 3 次」的重复提醒：触发后应当**滚到下一轮**（明天同一时刻），
+       而"送出去过"的证据落在台账（firedCount / lastFiredAt）里 */
+    const firedAt = Date.now();
+    ctl.handleReminderDue({
+      id: reminded.id, title: '提交报销单', category: '工作',
+      at: firedAt - 60000, dueAt: firedAt - 60000, firedAt: firedAt,
+      late: false, missed: 0, silent: false,
+      reminder: Object.assign({}, reminded.reminder, {
+        at: firedAt + 24 * 60 * 60 * 1000,   // 后端推进后的下一轮
+        lastFiredAt: firedAt, firedCount: 1,
+      }),
+    });
+    await sleep(160);
+    equal('到点推送写回台账', byTitle('提交报销单').reminder.firedCount, 1);
+    const rolledChip = chipOf('提交报销单');
+    check('重复提醒触发后滚到下一轮', !!rolledChip && /is-scheduled/.test(rolledChip.cls),
+      rolledChip ? rolledChip.cls : '（没有芯片）');
+    check('下一轮显示"明天"而不是停在旧时间',
+      !!rolledChip && rolledChip.text.indexOf('明天') >= 0 && rolledChip.text.indexOf('\u21bb') >= 0,
+      rolledChip ? rolledChip.text : '（没有芯片）');
+    check('到点条目被高亮', !!$('.item.is-reminding'));
+    check('应用内也提示了到点', hasToast('info', '提醒到点'), toastInfo());
+    ctl.select(reminded.id);
+    await sleep(140);
+    check('详情里能看到"最近提醒"', text('.remind-block .rb-hint').indexOf('最近提醒') >= 0,
+      text('.remind-block .rb-hint'));
+
+    /* 完成 → 默认按 onDone=cancel 结束这条重复提醒：语义是"已结束"，不是"已取消" */
+    await ctl.toggleStatus(reminded.id);
+    await sleep(170);
+    equal('完成后提醒被结束', byTitle('提交报销单').reminder.enabled, false);
+    equal('结束原因记为完成', byTitle('提交报销单').reminder.cancelReason, 'done');
+    const endedChip = chipOf('提交报销单');
+    check('完成后芯片变成"已结束"', !!endedChip && /is-done/.test(endedChip.cls),
+      endedChip ? endedChip.cls : '（没有芯片）');
+    check('芯片文案是"已结束"而不是"已取消"',
+      !!endedChip && endedChip.text.indexOf('已结束') >= 0 && endedChip.text.indexOf('已取消') < 0,
+      endedChip ? endedChip.text : '（没有芯片）');
+    check('没有出现"已取消"芯片', $$('.remind-chip.is-off').length === 0);
+    ctl.select(reminded.id);
+    await sleep(140);
+    check('详情把原因写清楚', text('.remind-block .rb-state').indexOf('已完成，提醒随之结束') >= 0,
+      text('.remind-block .rb-state'));
+
+    /* 恢复未完成：下一轮还在未来 → 提醒自动重开（这也是"完成时结束"的反向操作） */
+    await ctl.toggleStatus(reminded.id);
+    await sleep(150);
+    equal('恢复未完成时重开还有下一轮的提醒', byTitle('提交报销单').reminder.enabled, true);
+    const reopenedChip = chipOf('提交报销单');
+    check('重开后回到"已设置"', !!reopenedChip && /is-scheduled/.test(reopenedChip.cls),
+      reopenedChip ? reopenedChip.cls : '（没有芯片）');
+
+    /* 一次性提醒：到点后停在「已提醒」，完成 → 「已结束」，恢复 → 不会重开 */
+    ctl.startAdd();
+    type('#f-title', '取快递');
+    click('[data-act="set-category"][data-value="cat-life"]');
+    click('#f-remind-on');
+    await sleep(130);
+    check('一次性提醒没有结束条件控件', !$('#f-remind-end'));
+    setValue('#f-remind-at', model.toLocalInput(Date.now() + 60 * 60 * 1000));
+    await ctl.saveForm();
+    await sleep(170);
+    const parcel = byTitle('取快递');
+    check('一次性提醒已创建', !!parcel && !!parcel.reminder && parcel.reminder.repeat === 'none');
+
+    const parcelFired = Date.now();
+    ctl.handleReminderDue({
+      id: parcel.id, title: '取快递', category: '生活',
+      at: parcelFired - 60000, dueAt: parcelFired - 60000, firedAt: parcelFired,
+      late: false, missed: 0, silent: false,
+      reminder: Object.assign({}, parcel.reminder, {
+        at: parcelFired - 60000, lastFiredAt: parcelFired, firedCount: 1,
+      }),
+    });
+    await sleep(170);
+    const parcelChip = chipOf('取快递');
+    check('一次性提醒到点后芯片是"已提醒"（不是"已过期"）',
+      !!parcelChip && /is-fired/.test(parcelChip.cls), parcelChip ? parcelChip.cls : '（没有芯片）');
+    check('芯片文案写着"已提醒 + 时间"',
+      !!parcelChip && parcelChip.text.indexOf('已提醒') >= 0 &&
+      parcelChip.text.indexOf(model.toLocalInput(parcelFired - 60000).slice(11)) >= 0,
+      parcelChip ? parcelChip.text : '（没有芯片）');
+    ctl.select(parcel.id);
+    await sleep(140);
+    check('详情里的状态也是"已提醒"', text('.remind-block .rb-state').indexOf('已提醒') >= 0,
+      text('.remind-block .rb-state'));
+    check('详情里能查到最近提醒时间', text('.remind-block .rb-hint').indexOf('最近提醒') >= 0,
+      text('.remind-block .rb-hint'));
+
+    await ctl.toggleStatus(parcel.id);
+    await sleep(170);
+    equal('一次性提醒完成后也被结束', byTitle('取快递').reminder.cancelReason, 'done');
+    await ctl.toggleStatus(parcel.id);
+    await sleep(150);
+    equal('时间已过的提醒不会因为恢复未完成而重开', byTitle('取快递').reminder.enabled, false);
+
+    /* 第二条：验证「稍后 10 分钟」与「取消提醒」两个动作 */
+    ctl.startAdd();
+    type('#f-title', '预约体检');
+    click('[data-act="set-category"][data-value="cat-life"]');
+    click('#f-remind-on');
+    await sleep(130);
+    setValue('#f-remind-at', model.toLocalInput(Date.now() + 2 * 60 * 60 * 1000));
+    await ctl.saveForm();
+    await sleep(170);
+    const health = byTitle('预约体检');
+    check('第二条也带上了提醒', !!health && !!health.reminder);
+
+    await ctl.snoozeReminder(health.id, 10);
+    await sleep(150);
+    check('「稍后 10 分钟」把提醒推到 10 分钟后',
+      Math.abs(byTitle('预约体检').reminder.at - (Date.now() + 10 * 60000)) < 8000,
+      String(byTitle('预约体检').reminder.at));
+    equal('稍后之后提前量归零', byTitle('预约体检').reminder.advance, 0);
+
+    await ctl.cancelReminder(health.id);
+    await sleep(150);
+    equal('「取消提醒」关闭提醒', byTitle('预约体检').reminder.enabled, false);
+    equal('取消原因记为用户操作', byTitle('预约体检').reminder.cancelReason, 'user');
+    ctl.select(health.id);
+    await sleep(140);
+    const cancelledChip = chipOf('预约体检');
+    check('用户取消才显示"已取消"（带删除线）',
+      !!cancelledChip && /is-off/.test(cancelledChip.cls), cancelledChip ? cancelledChip.cls : '（没有芯片）');
+    check('详情写明是手动取消', text('.remind-block .rb-state').indexOf('手动取消') >= 0,
+      text('.remind-block .rb-state'));
+
+    /* 17) 通知设置面板 */
+    ctl.setMode('settings');
+    await sleep(200);
+    check('通知设置面板已打开', !!$('#panel-settings'));
+    check('显示权限状态卡', !!$('#perm-card') && text('#perm-label').indexOf('通知权限') >= 0,
+      text('#perm-label'));
+    check('权限状态是已知枚举之一',
+      /已授权|已被拒绝|尚未授权|当前环境不支持|未取到状态/.test(text('#perm-label')), text('#perm-label'));
+    check('提供测试通知按钮', !!$('[data-act="notify-test"]'));
+    check('列出当前提醒概览', text('#panel-settings').indexOf('已设置提醒') >= 0);
+
+    const notifyOn = ctl.state.settings.notifications.enabled;
+    click('[data-act="toggle-notify"]');
+    await sleep(160);
+    equal('系统通知总开关可以关', ctl.state.settings.notifications.enabled, !notifyOn);
+    click('[data-act="toggle-notify"]');
+    await sleep(160);
+    equal('系统通知总开关可以再打开', ctl.state.settings.notifications.enabled, notifyOn);
+
+    // 免打扰：先归零到关闭，再打开（不依赖上一轮留下的设置）
+    if (ctl.state.settings.notifications.dndEnabled) {
+      click('[data-act="toggle-dnd"]');
+      await sleep(170);
+    }
+    click('[data-act="toggle-dnd"]');
+    await sleep(180);
+    check('免打扰开启后出现时段输入',
+      !!$('[data-field="notifyDndFrom"]') && !!$('[data-field="notifyDndTo"]'));
+    equal('免打扰已开启', ctl.state.settings.notifications.dndEnabled, true);
+    setValue('[data-field="notifyDndFrom"]', '21:30');
+    await sleep(150);
+    equal('免打扰开始时间被保存', ctl.state.settings.notifications.dndFrom, '21:30');
+
+    ctl.setMode('view');
+    await sleep(130);
+
     await root.tiny.store.set(EXPECT_KEY, {
       titles: titles(),
       total: ctl.state.items.length,
@@ -512,6 +765,37 @@
       $$('.group').length >= 1 && $$('.group .group-title').length >= 1);
     check('重载后每条都挂在存在的分类上',
       ctl.state.items.every((t) => !!model.categoryById(ctl.state.categories, t.categoryId)));
+
+    /* 提醒也活过了重载：三类语义（活跃的重复 / 完成结束 / 用户取消）都要在 */
+    const keptReminder = byTitle('提交报销单');
+    check('重载后带提醒的条目还在', !!keptReminder && !!keptReminder.reminder,
+      JSON.stringify(keptReminder && keptReminder.reminder));
+    equal('重载后台账仍在（已触发 1 次）', keptReminder && keptReminder.reminder.firedCount, 1);
+    equal('重载后重复提醒仍活跃', keptReminder && keptReminder.reminder.enabled, true);
+    check('重载后显示"已设置"芯片', !!chipOf('提交报销单') && /is-scheduled/.test(chipOf('提交报销单').cls),
+      chipOf('提交报销单') ? chipOf('提交报销单').cls : '（没有芯片）');
+
+    const keptParcel = byTitle('取快递');
+    equal('一次性提醒的结束原因仍是"完成"', keptParcel && keptParcel.reminder.cancelReason, 'done');
+    check('重载后显示"已结束"芯片（不是"已取消"）',
+      !!chipOf('取快递') && /is-done/.test(chipOf('取快递').cls),
+      chipOf('取快递') ? chipOf('取快递').cls : '（没有芯片）');
+
+    const keptHealth = byTitle('预约体检');
+    equal('用户取消的提醒原因仍是"用户取消"', keptHealth && keptHealth.reminder.cancelReason, 'user');
+    check('重载后显示"已取消"芯片', !!chipOf('预约体检') && /is-off/.test(chipOf('预约体检').cls),
+      chipOf('预约体检') ? chipOf('预约体检').cls : '（没有芯片）');
+    equal('重载后通知设置一致（免打扰开始 21:30）',
+      ctl.state.settings.notifications.dndFrom, '21:30');
+
+    const schedule = await ctl.syncReminders();
+    const activeReminders = ctl.state.items.filter((t) => model.reminderActive(t.reminder)).length;
+    check('后端日程与页面活跃提醒一一对应',
+      !!schedule && schedule.entries.length === activeReminders,
+      'entries=' + (schedule && schedule.entries.length) + ' active=' + activeReminders);
+    check('后端把下一次触发排在未来',
+      !!schedule && schedule.entries.every((e) => e.nextAt == null || e.nextAt > Date.now()),
+      JSON.stringify(schedule && schedule.entries.map((e) => e.nextAt)));
 
     /* 造一份适合人工审阅的状态，导出深浅两套 UI 快照 */
     const cats = ctl.state.categories;
@@ -591,6 +875,7 @@
         await root.tiny.store.delete(ITEMS_KEY);
         await root.tiny.store.delete(CATS_KEY);
         await root.tiny.store.delete(UI_KEY);
+        await root.tiny.store.delete(SETTINGS_KEY);
         await root.tiny.store.set(PHASE_KEY, 'phase1');
         say('SELFTEST 已清空存储，重载页面（phase1 开始）');
         await sleep(250);

@@ -322,6 +322,337 @@ test('sanitize 保留分类字段，缺省时给空串（由 assignCategories �
   assert.equal(model.sanitize([{ title: 'C', categoryId: 42 }])[0].categoryId, '');
 });
 
+/* ---------------------------------------------------------------- 提醒 */
+
+test('sanitizeReminder：坏数据一律当作"没有提醒"', () => {
+  assert.equal(model.sanitizeReminder(null), null);
+  assert.equal(model.sanitizeReminder('明天'), null);
+  assert.equal(model.sanitizeReminder({ enabled: true }), null);          // 缺 at
+  assert.equal(model.sanitizeReminder({ at: 'soon' }), null);             // at 不是数字
+});
+
+test('sanitizeReminder：非法枚举回退，不重复就没有结束条件', () => {
+  const r = model.sanitizeReminder({
+    at: 1700000000000, advance: 7, repeat: 'yearly', endType: 'count',
+    endCount: 3, onDone: 'whatever', firedCount: -5, lastFiredAt: 'x',
+  });
+  assert.equal(r.advance, 0);          // 7 不是合法提前量 → 准时
+  assert.equal(r.repeat, 'none');
+  assert.equal(r.endType, 'never');    // 不重复 → 结束条件清空
+  assert.equal(r.endCount, null);
+  assert.equal(r.onDone, 'cancel');
+  assert.equal(r.firedCount, 0);
+  assert.equal(r.lastFiredAt, null);
+});
+
+test('reminderDueAt：触发时刻 = 提醒时间 − 提前量', () => {
+  const at = 1700000000000;
+  assert.equal(model.reminderDueAt({ at: at, advance: 0 }), at);
+  assert.equal(model.reminderDueAt({ at: at, advance: 5 }), at - 5 * 60000);
+  assert.equal(model.reminderDueAt({ at: at, advance: 1440 }), at - 24 * 60 * 60000);
+});
+
+test('reminderState：已设置 / 即将到期 / 已提醒 / 已过期 / 已结束 / 已取消', () => {
+  const now = Date.now();
+  const base = { enabled: true, at: now + 10 * 60 * 60000, advance: 0, repeat: 'none' };
+  assert.equal(model.reminderState(base, now).key, 'scheduled');
+  assert.equal(model.reminderState(Object.assign({}, base, { at: now + 10 * 60000 }), now).key, 'soon');
+
+  // 到点之后分两种：送出去过 = 已提醒；从没送出去 = 已过期（真的错过）
+  const past = Object.assign({}, base, { at: now - 60000 });
+  assert.equal(model.reminderState(past, now).key, 'missed');
+  assert.equal(model.reminderState(past, now).label, '已过期');
+  const fired = Object.assign({}, past, { firedCount: 1, lastFiredAt: now - 30000 });
+  assert.equal(model.reminderState(fired, now).key, 'fired');
+  assert.equal(model.reminderState(fired, now).label, '已提醒');
+
+  // 三种"结束"要分得清：完成 / 重复走完 / 用户取消
+  const done = model.cancelReminder(base, now, 'done');
+  assert.equal(model.reminderState(done, now).key, 'done');
+  assert.equal(model.reminderState(done, now).label, '已结束');
+  assert.match(model.reminderState(done, now).detail, /已完成/);
+
+  const ended = model.cancelReminder(base, now, 'series-end');
+  assert.equal(model.reminderState(ended, now).key, 'ended');
+  assert.equal(model.reminderState(ended, now).label, '重复已结束');
+
+  const off = model.cancelReminder(base, now, 'user');
+  assert.equal(model.reminderState(off, now).key, 'off');
+  assert.equal(model.reminderState(off, now).label, '已取消');
+  assert.match(model.reminderState(off, now).detail, /手动取消/);
+
+  assert.equal(model.reminderState(null, now).key, 'none');
+});
+
+test('reminderState：提前量为 1 天时，提前一天就进入"即将到期"', () => {
+  const now = Date.now();
+  const r = { enabled: true, at: now + 26 * 60 * 60000, advance: 1440, repeat: 'none' };
+  assert.equal(model.reminderState(r, now).key, 'scheduled');   // 触发时刻还在 2 小时后
+  assert.equal(model.reminderState(r, now + 23 * 60 * 60000).key, 'missed');  // 触发时刻已过、还没送出
+});
+
+test('normalizeReminderInput：过去的时间被拒绝，原时间可以保留', () => {
+  const now = Date.now();
+  const past = model.toLocalInput(now - 60 * 60000);
+
+  const rejected = model.normalizeReminderInput({ enabled: true, atText: past }, now);
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.errors.reminderAt, /已经过去/);
+
+  const kept = model.normalizeReminderInput(
+    { enabled: true, atText: past, keepAt: model.fromLocalInput(past) }, now);
+  assert.equal(kept.ok, true);
+  assert.equal(kept.value.enabled, true);
+});
+
+test('normalizeReminderInput：重复次数与截止日期的边界', () => {
+  const now = Date.now();
+  const at = model.toLocalInput(now + 60 * 60000);
+
+  const zero = model.normalizeReminderInput(
+    { enabled: true, atText: at, repeat: 'daily', endType: 'count', endCount: 0 }, now);
+  assert.equal(zero.ok, false);
+  assert.match(zero.errors.reminderEnd, /1 – 99/);
+
+  const tooMany = model.normalizeReminderInput(
+    { enabled: true, atText: at, repeat: 'daily', endType: 'count', endCount: 200 }, now);
+  assert.equal(tooMany.ok, false);
+
+  const early = model.normalizeReminderInput(
+    { enabled: true, atText: at, repeat: 'daily', endType: 'date', endDateText: '2020-01-01' }, now);
+  assert.equal(early.ok, false);
+  assert.match(early.errors.reminderEnd, /早于提醒时间/);
+
+  const good = model.normalizeReminderInput(
+    { enabled: true, atText: at, repeat: 'daily', endType: 'count', endCount: 3, advance: 5, onDone: 'keep' },
+    now);
+  assert.equal(good.ok, true);
+  assert.equal(good.value.endCount, 3);
+  assert.equal(good.value.advance, 5);
+  assert.equal(good.value.onDone, 'keep');
+});
+
+test('nextOccurrence：每天 / 每周 / 工作日（跳过周末）', () => {
+  const friday = new Date(2026, 9, 9, 9, 0, 0).getTime();      // 2026-10-09 周五 09:00
+  const daily = new Date(model.nextOccurrence(friday, 'daily', friday));
+  assert.equal(daily.getDate(), 10);
+  assert.equal(daily.getHours(), 9, '时:分沿用原时间');
+
+  const weekly = new Date(model.nextOccurrence(friday, 'weekly', friday));
+  assert.equal(weekly.getDate(), 16);
+
+  const workday = new Date(model.nextOccurrence(friday, 'weekdays', friday));
+  assert.equal(workday.getDay(), 1, '周五的下一个是周一');
+  assert.equal(workday.getDate(), 12);
+
+  assert.equal(model.nextOccurrence(friday, 'none', friday), null);
+});
+
+test('nextOccurrence：跳过已过去的周期（关闭几天后不会补一堆）', () => {
+  const start = new Date(2026, 9, 1, 8, 0, 0).getTime();
+  const now = new Date(2026, 9, 5, 12, 0, 0).getTime();
+  const next = new Date(model.nextOccurrence(start, 'daily', now));
+  assert.equal(next.getDate(), 6, '直接给下一个未来时刻');
+});
+
+test('advanceReminder：一次性提醒停在原地，重复提醒推进', () => {
+  const now = Date.now();
+  const oneOff = { enabled: true, at: now - 60000, advance: 0, repeat: 'none', firedCount: 0 };
+  const firedOne = model.advanceReminder(oneOff, now);
+  assert.equal(firedOne.at, oneOff.at, '一次性提醒不改时间（UI 显示"已过期"）');
+  assert.equal(firedOne.firedCount, 1);
+  assert.equal(firedOne.lastFiredAt, now);
+  assert.equal(firedOne.enabled, true);
+
+  const daily = { enabled: true, at: now - 60000, advance: 0, repeat: 'daily', firedCount: 0 };
+  const firedDaily = model.advanceReminder(daily, now);
+  assert.ok(firedDaily.at > now, '重复提醒推进到下一个未来时刻');
+  assert.equal(firedDaily.firedCount, 1);
+});
+
+test('advanceReminder：次数用尽 / 超出截止日期 → 结束整条提醒', () => {
+  const now = Date.now();
+  const counted = model.advanceReminder(
+    { enabled: true, at: now - 60000, advance: 0, repeat: 'daily', endType: 'count', endCount: 2, firedCount: 1 },
+    now);
+  assert.equal(counted.enabled, false);
+  assert.equal(counted.cancelReason, 'series-end');
+  assert.equal(counted.firedCount, 2);
+
+  const dated = model.advanceReminder(
+    { enabled: true, at: now - 60000, advance: 0, repeat: 'daily', endType: 'date', endDate: now + 60000, firedCount: 0 },
+    now);
+  assert.equal(dated.enabled, false);
+  assert.match(model.reminderState(dated, now).label, /重复已结束/);
+});
+
+test('reminderPending：到点但没送过才算"待触发"', () => {
+  const now = Date.now();
+  const pending = { enabled: true, at: now - 60000, advance: 0, repeat: 'none', lastFiredAt: null };
+  assert.equal(model.reminderPending(pending, now), true);
+  assert.equal(model.reminderPending(Object.assign({}, pending, { lastFiredAt: now }), now), false);
+  assert.equal(model.reminderPending(Object.assign({}, pending, { enabled: false }), now), false);
+  assert.equal(model.reminderPending({ enabled: true, at: now + 60000, advance: 0 }, now), false);
+});
+
+test('create / patch 带上提醒；同日程改标题不会丢台账', () => {
+  const now = Date.now();
+  const at = now + 60 * 60000;
+  const cats = model.defaultCategories(now);
+  const input = {
+    title: '带提醒的待办', categoryId: 'cat-work',
+    reminder: { enabled: true, atText: model.toLocalInput(at), advance: 5, repeat: 'daily' },
+  };
+
+  const created = model.create(input, now, cats);
+  assert.equal(created.ok, true);
+  assert.equal(created.todo.reminder.at, model.fromLocalInput(model.toLocalInput(at)));
+  assert.equal(created.todo.reminder.advance, 5);
+
+  const fired = Object.assign({}, created.todo, {
+    reminder: Object.assign({}, created.todo.reminder, { firedCount: 2, lastFiredAt: now - 1000 }),
+  });
+  const edited = model.patch(fired, {
+    title: '改过标题', categoryId: 'cat-work',
+    reminder: { enabled: true, atText: model.toLocalInput(at), advance: 5, repeat: 'daily' },
+  }, now, cats);
+  assert.equal(edited.ok, true);
+  assert.equal(edited.todo.reminder.firedCount, 2, '同日程保留已触发次数');
+  assert.equal(edited.todo.reminder.lastFiredAt, now - 1000);
+
+  const changed = model.patch(fired, {
+    title: '换了时间', categoryId: 'cat-work',
+    reminder: { enabled: true, atText: model.toLocalInput(at + 3600000), advance: 5, repeat: 'daily' },
+  }, now, cats);
+  assert.equal(changed.todo.reminder.firedCount, 0, '换了日程就是新的一轮');
+});
+
+test('create：关闭提醒时不产生 reminder 字段', () => {
+  const now = Date.now();
+  const cats = model.defaultCategories(now);
+  const created = model.create({ title: '没有提醒', categoryId: 'cat-work', reminder: { enabled: false } }, now, cats);
+  assert.equal(created.ok, true);
+  assert.equal(created.todo.reminder, null);
+});
+
+test('setStatus：完成按 onDone 处置提醒，恢复时重新打开', () => {
+  const now = Date.now();
+  const at = now + 60 * 60000;
+  const base = {
+    id: 't1', title: '写周报', status: 'open', createdAt: now, updatedAt: now, doneAt: null,
+    reminder: {
+      enabled: true, at: at, advance: 0, repeat: 'none', onDone: 'cancel',
+      firedCount: 0, lastFiredAt: null, cancelledAt: null, cancelReason: null,
+    },
+  };
+
+  const done = model.setStatus(base, 'done', now);
+  assert.equal(done.status, 'done');
+  assert.equal(done.reminder.enabled, false);
+  assert.equal(done.reminder.cancelReason, 'done');
+
+  const reopened = model.setStatus(done, 'open', now);
+  assert.equal(reopened.reminder.enabled, true, '时间没到的自动取消会恢复');
+  assert.equal(reopened.reminder.cancelReason, null);
+
+  const keep = Object.assign({}, base, { reminder: Object.assign({}, base.reminder, { onDone: 'keep' }) });
+  assert.equal(model.setStatus(keep, 'done', now).reminder.enabled, true, 'onDone=keep 时提醒继续');
+});
+
+test('sanitize：保留合法提醒，丢掉坏提醒', () => {
+  const list = model.sanitize([
+    { title: 'A', reminder: { at: 1700000000000, advance: 5, repeat: 'weekly' } },
+    { title: 'B', reminder: { nope: true } },
+    { title: 'C' },
+  ]);
+  assert.equal(list[0].reminder.advance, 5);
+  assert.equal(list[0].reminder.repeat, 'weekly');
+  assert.equal(list[1].reminder, null);
+  assert.equal(list[2].reminder, null);
+});
+
+test('提醒文案：芯片按语义分（已提醒 ≠ 已过期 ≠ 已取消）', () => {
+  const now = new Date(2026, 9, 8, 20, 0, 0).getTime();
+  const soon = new Date(2026, 9, 8, 20, 50, 0).getTime();
+  const r = { enabled: true, at: soon, advance: 5, repeat: 'daily', endType: 'count', endCount: 3 };
+
+  assert.equal(model.reminderTiming(r, now), '今天 20:50');
+  assert.equal(model.reminderChipText(r, now), '⏰ 即将 今天 20:50 ↻');
+  assert.match(model.reminderSummary(r, now), /提前 5 分钟/);
+  assert.equal(model.reminderRepeatText(r), '每天 · 共 3 次');
+  assert.equal(model.dayLabel(new Date(2026, 9, 9, 9, 0).getTime(), now), '明天');
+
+  const far = Object.assign({}, r, { at: new Date(2026, 9, 9, 9, 0, 0).getTime() });
+  assert.equal(model.reminderChipText(far, now), '⏰ 明天 09:00 ↻');
+
+  // 送出去过 → 已提醒；到点但从没送出 → 已过期
+  const fired = { enabled: true, at: now - 60000, advance: 0, repeat: 'none',
+    firedCount: 2, lastFiredAt: now - 30000 };
+  assert.equal(model.reminderChipText(fired, now), '⏰ 已提醒 今天 19:59');
+  assert.equal(model.reminderChipText(Object.assign({}, fired, { firedCount: 0, lastFiredAt: null }), now),
+    '⏰ 已过期 今天 19:59');
+
+  // 结束的三种：完成 / 重复走完 / 用户取消
+  const base = { enabled: true, at: soon, advance: 0, repeat: 'none' };
+  assert.equal(model.reminderChipText(model.cancelReminder(base, now, 'done'), now), '⏰ 已结束');
+  assert.equal(model.reminderChipText(model.cancelReminder(base, now, 'series-end'), now), '⏰ 重复已结束');
+  assert.equal(model.reminderChipText(model.cancelReminder(base, now, 'user'), now), '⏰ 已取消');
+  assert.equal(model.reminderAdvanceText({ advance: 1440 }), '提前 1 天');
+});
+
+test('reminderStats / reminderQueue：统计与排序', () => {
+  const now = Date.now();
+  const items = [
+    { id: 'plain' },
+    { id: 'a', reminder: { enabled: true, at: now + 10 * 60000, advance: 0, repeat: 'none' } },
+    { id: 'b', reminder: { enabled: true, at: now - 30 * 60000, advance: 0, repeat: 'none' } },
+    { id: 'c', reminder: { enabled: false, at: now + 60000, advance: 0, repeat: 'none' } },
+  ];
+
+  const stats = model.reminderStats(items, now);
+  assert.equal(stats.total, 3, '有关联提醒的三条（含已取消）');
+  assert.equal(stats.active, 2);
+  assert.equal(stats.soon, 1);
+  assert.equal(stats.due, 1);
+  assert.equal(stats.pending, 1, '一条到点但没触发过');
+
+  const queue = model.reminderQueue(items, now);
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].id, 'b');
+  assert.equal(model.reminderQueue(items, now, { onlyDue: false }).length, 2);
+});
+
+test('通知设置：归一化 + 免打扰跨零点', () => {
+  const defaults = model.sanitizeNotifications(null);
+  assert.equal(defaults.enabled, true);
+  assert.equal(defaults.sound, true);
+  assert.equal(defaults.catchUp, true);
+
+  const custom = model.sanitizeNotifications({
+    enabled: false, sound: false, dndEnabled: true, dndFrom: '99:99', dndTo: '08:00',
+  });
+  assert.equal(custom.enabled, false);
+  assert.equal(custom.dndFrom, '22:00', '非法时间回退到默认');
+  assert.equal(custom.dndTo, '08:00');
+
+  const night = { dndEnabled: true, dndFrom: '22:00', dndTo: '08:00' };
+  assert.equal(model.inQuietHours(night, new Date(2026, 9, 8, 23, 30).getTime()), true);
+  assert.equal(model.inQuietHours(night, new Date(2026, 9, 8, 7, 0).getTime()), true);
+  assert.equal(model.inQuietHours(night, new Date(2026, 9, 8, 12, 0).getTime()), false);
+  assert.equal(model.inQuietHours({ dndEnabled: false, dndFrom: '22:00', dndTo: '08:00' },
+    new Date(2026, 9, 8, 23, 30).getTime()), false);
+  assert.equal(model.quietHoursText(night), '22:00 – 08:00');
+});
+
+test('toLocalInput / fromLocalInput 往返不丢时间', () => {
+  const ts = new Date(2026, 9, 8, 9, 5, 0).getTime();
+  const text = model.toLocalInput(ts);
+  assert.equal(text, '2026-10-08T09:05');
+  assert.equal(model.fromLocalInput(text), ts);
+  assert.equal(model.fromLocalInput('乱写'), null);
+  assert.equal(model.fromLocalInput(''), null);
+});
+
 /* ------------------------------------------------------------------ 结果 */
 
 console.log('\n通过 ' + passed + ' 项，失败 ' + failed + ' 项');

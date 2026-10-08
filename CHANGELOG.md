@@ -1,5 +1,143 @@
 # 变更清单
 
+## 0.3.2 —— 提醒状态按语义重做（"已取消"不再乱贴）
+
+**现象**：一条待办被标记完成后，它的提醒芯片显示「已取消」；已经**提醒过**（弹出过系统通知）的条目
+在完成之后同样显示「已取消」—— "取消"读起来像是用户主动关掉的，语义不对；另外"已过期"曾被同时用在
+"已经提醒过、等你处理"和"到点了却一次都没送出去"两种完全不同的情况上。
+
+**原因**：状态只按"开关是不是开着"分（enabled / disabled + cancelReason），没有区分
+**"送出去过"、"到点但没送出"、"因为完成而结束"、"用户手动取消"**。
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 1.1 | 状态从一个 `overdue` 拆成按语义的七态：**已设置 / 即将到期 / 已提醒（`firedCount ≥ 1`）/ 已过期（到点但从没送出）/ 已结束（完成时结束）/ 重复已结束 / 已取消（用户手动）** | `model.js` |
+| 1.2 | 新增 `REMINDER_END_DETAIL`：把"为什么结束"写清楚（手动取消，设置保留 / 已完成，提醒随之结束 / 重复次数或截止日期已到），详情块直接拼在状态后面 | `model.js` `ui.js` |
+| 1.3 | 芯片文案与配色按语义给：已提醒（琥珀，带具体时间）/ 已过期（红）/ 已结束 与 重复已结束（灰，**无删除线**）/ 已取消（灰 + 删除线） | `model.js` `style.css` |
+| 1.4 | `reminderStats` / `reminderQueue`（"到点"横幅）改按 已提醒 + 已过期 统计 | `model.js` |
+| 1.5 | 保存提示、完成/恢复提示改用新文案（"提醒已结束（已完成，提醒随之结束）"），不再说"已自动取消" | `app.js` |
+| 1.6 | 详情里"尚未触发过"改为「尚未提醒过」，并在有台账时显示"最近提醒：…" | `ui.js` |
+| 1.7 | 单元测试补三组语义断言（已提醒 ≠ 已过期 ≠ 已取消；重复走完；完成结束） | `tools/model.test.js` |
+| 1.8 | 端到端自检改用**按标题定位芯片**的辅助函数（列表里可能同时有多个芯片），并分别覆盖"重复提醒滚到下一轮"与"一次性提醒停在已提醒"两条路径；自检同时纳入 `todo.settings.v1` 的重置（不然上一轮的通知设置会干扰下一轮断言） | `tools/selftest.js` |
+| 1.9 | 版本号 0.3.1 → 0.3.2 | `tinyjs.json` `README.md` |
+
+> 语义小结（README「提醒与通知」里也有表格）：**已提醒 = 送出去过**，**已过期 = 到点但没送出**，
+> **已结束 = 完成时结束**，**已取消 = 用户手动关掉**；重复提醒触发后不停在"已提醒"，
+> 而是直接滚到下一轮，送出去的证据留在详情的"最近提醒"里。
+
+## 0.3.1 —— 修复：通知推送里的台账"慢一拍"
+
+**现象**：到点弹出系统通知后，点回应用里的**详情面板仍显示「尚未触发过」**（"最近提醒"一行是空的），
+列表芯片也停在旧状态；**关掉应用再打开才显示正确**的"最近提醒：2026-10-08 21:28"。
+
+**原因**：后端到点推送的 `reminder-due` 里塞的是**投递之前**的日程对象 —— `firedCount: 0`、
+`lastFiredAt: null`（重复提醒还带着上一轮的时间），页面据此写回条目，于是应用内看到的是"还没触发过"；
+而重启时页面会做一次同步往返，从后端台账里把正确的值取回来 —— 这正是"关掉再进就对了"的由来。
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 1.1 | `check()` 改为把**推进之后**的日程交给 `deliver()`：`firedCount` / `lastFiredAt` 已更新，重复提醒的 `at` 已滚到下一轮，整条结束则 `enabled=false` | `src/main.js` |
+| 1.2 | `deliver()` 用 `info.at`（刚触发的那个时刻）拼横幅副标题与事件的 `at`，与"推进后的 `reminder.at`"区分开 —— 通知写的是"刚提醒的那一轮"，页面写回的是"下一轮" | `src/main.js` |
+| 1.3 | 页面收到推送、写回台账后回同步一次（`scheduleReminderSync`），两边状态立即对齐 | `src/frontend/js/app.js` |
+| 1.4 | 回归测试：断言推送里的 `firedCount` / `lastFiredAt` / 下一轮时间 / 结束状态都必须是"投递之后"的值（一次性 / 重复 / 次数结束三种） | `tools/reminder.test.js` |
+| 1.5 | 版本号 0.3.0 → 0.3.1 | `tinyjs.json` `README.md` |
+
+## 0.3.0 —— 待办定时提醒与系统级通知
+
+需求：每条待办可设置提醒（日期时间 / 提前量 / 重复规则与结束条件），到点走**操作系统原生通知**而
+不只是应用内提示；应用未聚焦、窗口关掉、甚至应用没打开时都要能按时（或补发）提醒；点击通知要能
+聚焦窗口、跳到对应待办并高亮；同时给出通知权限、总开关、免打扰与提示音的控制。
+
+### 1. 提醒模型（`src/frontend/js/model.js`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 1.1 | 待办新增可选字段 `reminder`：`enabled / at / advance / repeat / endType / endCount / endDate / onDone / firedCount / lastFiredAt / cancelledAt / cancelReason` | `model.js` |
+| 1.2 | 新增枚举与文案：提前量（准时·5 分钟…2 天）、重复（不重复 / 每天 / 每周 / 工作日）、结束条件（不限 / 按次数 / 按日期）、完成后处置（自动取消 / 保留） | `model.js` |
+| 1.3 | 新增纯函数：`reminderDueAt`（触发时刻 = 提醒时间 − 提前量）、`reminderState`（已设置 / 即将到期 / 已过期 / 已取消）、`reminderPending`、`reminderActive` | `model.js` |
+| 1.4 | 新增重复推进 `stepOccurrence` / `nextOccurrence`（用 `Date` 构造器做加法，跨月 / 跨年 / 夏令时交给平台日历）与 `advanceReminder`（一次性停在原地、重复推进到下一轮、次数或日期用尽即结束） | `model.js` |
+| 1.5 | 新增输入校验 `normalizeReminderInput`（过去的时间被拒；`keepAt` 允许保留"已到点"的原时间）与表单态 `reminderForm` | `model.js` |
+| 1.6 | 新增文案：`reminderTiming` / `reminderAdvanceText` / `reminderRepeatText` / `reminderSummary` / `reminderChipText` / `dayLabel` / `toLocalInput` / `fromLocalInput` | `model.js` |
+| 1.7 | 新增总览与队列：`reminderStats`（条数 / 活跃 / 到点 / 即将到期 / 待补发）、`reminderQueue`（按触发时刻排序） | `model.js` |
+| 1.8 | `sanitize()` 归一化 `reminder`（结构坏了就当作没设置）；`validate` / `create` / `patch` 携带并校验提醒；`patch` 同日程保留台账（改标题不会重置"已触发次数"） | `model.js` |
+| 1.9 | `setStatus` 按 `onDone` 处置提醒（默认完成后自动取消），恢复为未完成时自动重开"因完成而取消、且时间未到"的提醒 | `model.js` |
+| 1.10 | 新增通知设置模型：`DEFAULT_NOTIFICATIONS` / `sanitizeNotifications` / `inQuietHours`（支持跨零点）/ `quietHoursText` | `model.js` |
+
+### 2. 后端提醒调度（`src/main.js`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 2.1 | 新增调度器：`syncReminders` / `reminderState` / `clearReminders` / `testNotification` 四个 API，页面仍是数据拥有者（每次变更整体同步） | `main.js` |
+| 2.2 | 15 秒 tick 的定时器 `check()` + `processEntry()`：到点的提醒一律当场送出，睡眠唤醒 / 时钟跳变后靠"到点就补"兜底 | `main.js` |
+| 2.3 | 通知投递 `deliver()`：`app.notify({ title, body, subtitle, id, sound })` —— 标题＝待办标题、副标题＝分类 · 提醒时间、正文＝提前量 / 补发说明；同时 `app.push('reminder-due')` 让页面即时更新 | `main.js` |
+| 2.4 | 送达台账按**轮次**记账（`firedAt`）并落盘 `reminders.json`：页面刷新、窗口关掉、应用重启后不会重复弹同一条 | `main.js` |
+| 2.5 | 重复提醒由后端推进周期（每天 / 每周 / 工作日，跳过已过去的多轮，只补发一条并标注"错过 N 次"） | `main.js` |
+| 2.6 | 结束条件：次数 / 截止日期用尽后整条提醒结束（`cancelReason: series-end`），并把结果回写页面 | `main.js` |
+| 2.7 | 通知总开关与免打扰时段在投递侧生效：被挡下时不弹横幅，但仍推送应用内事件（`skipped: disabled / quiet-hours`） | `main.js` |
+| 2.8 | 通知点击回流：`export function onNotificationClick(id)` → `app.push('reminder-open')`，页面据此聚焦窗口并高亮 | `main.js` |
+| 2.9 | 启动钩子 `init(app)`：先读回台账 → 补发"关闭期间到点"的提醒 → 挂定时器 | `main.js` |
+
+### 3. 桥接层（`src/frontend/js/app-ns.js`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 3.1 | **修复** `bridge.notify`：原来调用不存在的 `tiny.app.notify(...)`（页面 API 是顶层 `tiny.notify(title, body, opts)`），错误被 catch 吞掉 → 系统通知从未发出；现在按正确签名调用 | `app-ns.js` |
+| 3.2 | 新增权限：`notifyPermission` / `requestNotifyPermission`（`tiny.app.permissions`）+ `openNotificationSettings`（被拒后的引导） | `app-ns.js` |
+| 3.3 | 新增事件：`onNotifyClick`（通知点击）/ `onReminderDue`（后端到点推送） | `app-ns.js` |
+| 3.4 | 新增日程：`syncReminders` / `reminderState` / `clearReminders` / `testNotify` | `app-ns.js` |
+| 3.5 | 新增环境：`capabilities`（判 `caps.notifications !== false`）/ `focusWindow` / `windowFocused` / `loginItem` / `setLoginItem` | `app-ns.js` |
+| 3.6 | 版本号常量 0.1.0 → 0.3.0（导出备份里会用到） | `app-ns.js` |
+
+### 4. 视图层（`src/frontend/js/ui.js` + `style.css`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 4.1 | 新建 / 编辑表单新增「提醒」字段组：开关 + `datetime-local` + 提前量 + 重复 + 结束条件（次数 / 日期）+ 完成后处置 + 实时确认文案 | `ui.js` |
+| 4.2 | 列表条目新增提醒芯片 `⏰ …`，四态四色：已设置（蓝）/ 即将到期（琥珀）/ 已过期（红）/ 已取消（灰、删除线），重复提醒带 `↻` | `ui.js` `style.css` |
+| 4.3 | 展开条目与查看面板新增提醒块：时间 + 提前量 + 重复 + 状态 + 上次提醒（累计次数） | `ui.js` |
+| 4.4 | 左栏头部新增「有 N 条提醒到点」横幅，可一键跳到最近一条或收起 | `ui.js` `style.css` |
+| 4.5 | 到点条目呼吸式高亮 6 秒（`is-reminding`），点击通知 / 横幅后自动褪去 | `ui.js` `style.css` |
+| 4.6 | 新增「通知」面板（第六个页签，`⌘,` 或菜单栏进入）：权限状态卡（已授权 / 已被拒绝 / 尚未授权 / 当前环境不支持，各自给出下一步）+ 总开关 + 提示音 + 免打扰时段 + 错过补发 + 登录时自动启动 + 测试通知 + 提醒概览 + 机制与边界说明 | `ui.js` `style.css` |
+| 4.7 | 新增开关 / 权限卡 / 设置分组 / 提醒芯片等组件样式，全部走既有主题令牌（深浅两套自动跟随） | `style.css` |
+
+### 5. 控制器（`src/frontend/js/app.js`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 5.1 | 提醒日程同步：`reminderEntry` / `syncReminders`（防抖 120ms）/ `applySchedule`（把后端推进过的提醒时间与台账写回条目） | `app.js` |
+| 5.2 | 到点事件 `handleReminderDue`：写台账 → 应用内提示 → 高亮；通知点击 `openReminder`：聚焦窗口 → 选中 → 高亮 → 滚动到可见 | `app.js` |
+| 5.3 | 提醒动作：`cancelReminder`（保留设置、标记用户取消）、`snoozeReminder`（稍后 10 分钟，提前量归零） | `app.js` |
+| 5.4 | 通知设置动作：`toggleNotifySwitch`（总开关 / 提示音 / 免打扰 / 补发）、`setDndTime`、`toggleAutoStart`、`requestPermission`、`refreshPermission`、`sendTestNotification`，设置持久化到 `todo.settings.v1` | `app.js` |
+| 5.5 | 表单接线：草稿里存提醒输入态，`onInput` 只更新草稿与确认文案（不重绘，datetime 选择器不被打断），`onChange` 才重绘结构 | `app.js` |
+| 5.6 | 表单校验合并提醒错误（`reminderAt` / `reminderEnd`），保存提示里带上提醒状态（含"提醒已取消"） | `app.js` |
+| 5.7 | 完成 / 恢复时提示提醒的处置结果；删除条目时同步撤掉它的日程 | `app.js` |
+| 5.8 | 页面侧定时器：每 20 秒重算提醒状态（跨过阈值才重绘）；浏览器预览模式下自己补发到点提醒（应用内提示 + 浏览器 Notification） | `app.js` |
+| 5.9 | 菜单栏新增「通知设置…」（`⌘,`），页面内快捷键同步支持 | `app.js` |
+| 5.10 | **首次用上提醒时请求权限**：保存第一条带提醒的待办时，若权限仍是"未决定"，先弹应用内说明再请求系统授权（仅在打包后的 `.app` 里；`tiny.app.info().tinyjs === 'dev'` 视为 dev 不请求） | `app.js` `app-ns.js` |
+
+### 6. 持久化（`src/frontend/js/store.js`）
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 6.1 | 新增键 `todo.settings.v1`（通知设置），`loadSettings` / `saveSettings`，并纳入 `clearAll()` | `store.js` |
+| 6.2 | 后端台账 `reminders.json` 写在应用数据目录（与 `store.json` 同目录），与应用数据一起备份 / 删除 | `main.js` |
+
+### 7. 测试
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 7.1 | 模型层单测 28 → **48 项**：提醒归一化 / 状态推导 / 重复推进 / 输入校验 / 文案 / 统计队列 / 完成处置 / 通知设置 | `tools/model.test.js` |
+| 7.2 | 新增后端调度单测 **18 项**（Node + `tjs` 桩）：到点投递 / 台账落盘 / 重复滚动 / 次数与日期结束 / 工作日跳过周末 / 长时间关闭只补一条 / 页面刷新不重复弹 / 总开关与免打扰 / 名单撤销 / 测试通知 / 点击回流 | `tools/reminder.test.js` |
+| 7.3 | 端到端自检新增提醒与通知用例：表单 → 芯片 → 详情块 → 校验拦截 → 到点推送 → 高亮 → 完成处置 → 取消 / 稍后 → 通知设置交互 → 重载后台账与设置仍在 → 后端日程对齐 | `tools/selftest.js` |
+
+### 8. 文档与版本
+
+| # | 变更 | 文件 |
+| --- | --- | --- |
+| 8.1 | README 新增「提醒与通知」一节：字段语义、触发链路、权限与引导、总开关 / 免打扰 / 提示音、**机制与限制**（应用退出期间无法提醒、dev 下回落到「脚本编辑器」、打包才有原生横幅、专注模式、Linux 无回复框…） | `README.md` |
+| 8.2 | README 功能特性 / 鼠标表 / 快捷键表 / 数据存储表 / 测试说明 / 目录结构同步更新 | `README.md` |
+| 8.3 | 版本号 0.2.3 → 0.3.0（`tinyjs.json`、README 示例、前端版本常量） | `tinyjs.json` `README.md` `app-ns.js` |
+
 ## 0.2.3 —— README 精简
 
 按发布口径收敛文档：去掉「贡献指南」「联系方式」两节，许可证一节只保留授权与免责说明。无功能改动。

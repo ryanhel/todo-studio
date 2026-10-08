@@ -92,6 +92,8 @@
                 el('span', { class: 'count', id: 'list-count', text: '0' })]),
             el('div', { class: 'filters', id: 'filters', role: 'tablist' }),
             el('div', { class: 'focus-chip', id: 'focus-chip', hidden: true }),
+            /* 提醒到点横幅：只在有"到点未处理"的条目时出现（一次性入口，指路用） */
+            el('div', { class: 'remind-banner', id: 'remind-banner', hidden: true, role: 'status' }),
           ]),
           el('div', { class: 'pane-body', id: 'list-body' }, [
             el('div', { class: 'collapsed-note', id: 'list-collapsed-note', hidden: true }),
@@ -125,8 +127,8 @@
     rootEl.appendChild(shell);
 
     ['stats', 'btn-new', 'theme-switch', 'pane-list', 'list-toggle', 'list-count', 'filters',
-     'focus-chip', 'list-body', 'list-collapsed-note', 'groups', 'empty', 'list-foot', 'pane-panel',
-     'mode-tabs', 'draft-badge', 'panel-body', 'draft-banner', 'panel-content', 'store-state',
+     'focus-chip', 'remind-banner', 'list-body', 'list-collapsed-note', 'groups', 'empty', 'list-foot',
+     'pane-panel', 'mode-tabs', 'draft-badge', 'panel-body', 'draft-banner', 'panel-content', 'store-state',
      'env-info', 'btn-export', 'toasts'].forEach(function (id) {
       refs[id] = shell.querySelector('#' + id);
     });
@@ -220,10 +222,21 @@
     const expanded = !!view.expanded[todo.id];
     const isDone = todo.status === 'done';
     const excerpt = model.excerpt(todo.note, 64);
+    const now = view.now || Date.now();
+
+    // 提醒芯片：列表里一眼能看出"设了没有 / 快到了 / 已过期 / 已取消"
+    const reminder = todo.reminder;
+    const reminderState = reminder ? model.reminderState(reminder, now) : { key: 'none' };
+    const reminderActive = model.reminderActive(reminder);
 
     const line1 = el('div', { class: 'item-line1' }, [
       el('span', { class: 'dot ' + todo.status, 'aria-hidden': 'true' }),
       el('span', { class: 'item-title', text: todo.title }),
+      reminder ? el('span', {
+        class: 'remind-chip is-' + reminderState.key,
+        text: model.reminderChipText(reminder, now),
+        title: '提醒：' + model.reminderSummary(reminder, now),
+      }) : null,
       el('span', { class: 'prio prio-' + todo.priority, text: model.PRIORITY_LABEL[todo.priority] }),
     ]);
 
@@ -238,19 +251,29 @@
         el('dt', { text: '创建' }), el('dd', { text: model.absoluteTime(todo.createdAt) }),
         el('dt', { text: '更新' }), el('dd', { text: model.absoluteTime(todo.updatedAt) }),
         el('dt', { text: '完成' }), el('dd', { text: todo.doneAt ? model.absoluteTime(todo.doneAt) : '—' }),
+        el('dt', { text: '提醒' }), el('dd', { text: model.reminderSummary(reminder, now) }),
+        el('dt', { text: '上次提醒' }),
+        el('dd', { text: reminder && reminder.lastFiredAt ? model.absoluteTime(reminder.lastFiredAt) : '—' }),
         el('dt', { text: 'ID' }), el('dd', { class: 'mono', text: todo.id }),
       ]),
       el('div', { class: 'item-note', text: todo.note || '（无备注）' }),
       el('div', { class: 'item-actions' }, [
         el('button', { class: 'btn ghost sm', dataset: { act: 'view', id: todo.id }, text: '查看' }),
         el('button', { class: 'btn ghost sm', dataset: { act: 'edit', id: todo.id }, text: '编辑' }),
+        reminderActive
+          ? el('button', {
+              class: 'btn ghost sm', dataset: { act: 'remind-cancel', id: todo.id },
+              title: '关闭这条待办的提醒（保留设置，可在编辑里重新打开）', text: '取消提醒',
+            })
+          : null,
         el('button', { class: 'btn danger-ghost sm', dataset: { act: 'delete', id: todo.id }, text: '删除' }),
       ]),
     ]);
 
     return el('article', {
       class: 'item' + (selected ? ' is-selected' : '') +
-        (isDone ? ' is-done' : '') + (expanded ? ' is-expanded' : ''),
+        (isDone ? ' is-done' : '') + (expanded ? ' is-expanded' : '') +
+        (view.highlightId === todo.id ? ' is-reminding' : ''),
       dataset: { id: todo.id, act: 'select' },
       tabindex: '0',
       'aria-current': selected ? 'true' : 'false',
@@ -418,13 +441,16 @@
   }
   /* ------------------------------------------------------------ 渲染：模式页签 */
 
-  const MODE_LABEL = { view: '查看', add: '新建', edit: '编辑', delete: '删除', categories: '分类' };
+  const MODE_LABEL = {
+    view: '查看', add: '新建', edit: '编辑', delete: '删除', categories: '分类', settings: '通知',
+  };
   const MODE_HINT = {
     view: '查看所选待办的详情',
     add: '新建表单 · 入口：顶栏「＋ 新建待办」或 ⌘N',
     edit: '编辑所选待办（保存后生效）',
     delete: '删除所选待办（需二次确认）',
     categories: '管理分类：新增 / 重命名 / 换色 / 删除',
+    settings: '系统通知：权限、总开关、免打扰与提示音',
   };
 
   /**
@@ -444,7 +470,7 @@
       }));
     }
 
-    ['view', 'edit', 'delete', 'categories'].forEach(function (mode) {
+    ['view', 'edit', 'delete', 'categories', 'settings'].forEach(function (mode) {
       const needsSelection = mode === 'edit' || mode === 'delete';
       const disabled = needsSelection && !view.selected;
       box.appendChild(el('button', {
@@ -503,6 +529,7 @@
         kv('状态', model.STATUS_LABEL[todo.status] + '（' + todo.status + '）'),
         kv('优先级', model.PRIORITY_LABEL[todo.priority] + '（' + todo.priority + '）'),
         kv('标识', todo.id, true))),
+      renderReminderBlock(todo, view),
       el('div', { class: 'note-block' }, [
         el('h4', { text: '备注' }),
         el('p', { class: 'note-text', id: 'view-note', text: todo.note || '（无备注）' }),
@@ -513,8 +540,59 @@
           class: 'btn', dataset: { act: 'toggle-status', id: todo.id },
           text: done ? '恢复为未完成' : '标记完成',
         }),
+        model.reminderActive(todo.reminder)
+          ? el('button', {
+              class: 'btn', dataset: { act: 'remind-snooze', id: todo.id },
+              title: '把提醒时间推到 10 分钟后', text: '稍后 10 分钟',
+            })
+          : null,
+        model.reminderActive(todo.reminder)
+          ? el('button', {
+              class: 'btn ghost', dataset: { act: 'remind-cancel', id: todo.id },
+              title: '关闭这条提醒（设置保留，可在编辑里重新打开）', text: '取消提醒',
+            })
+          : null,
         el('button', { class: 'btn danger-ghost', dataset: { act: 'delete', id: todo.id }, text: '删除…' }),
       ]),
+    ]);
+  }
+
+  /**
+   * 详情里的提醒块：一句话说清"什么时候提醒 + 状态 + 最近一次提醒".
+   * 状态用与列表芯片同一套 key（is-scheduled / is-soon / is-fired / is-missed / is-done / is-ended / is-off），
+   * 所以视觉标识在列表与详情里完全一致；"为什么结束"写在状态后面（已结束 · 已完成，提醒随之结束）。
+   */
+  function renderReminderBlock(todo, view) {
+    const now = view.now || Date.now();
+    const reminder = todo.reminder;
+
+    if (!reminder) {
+      return el('div', { class: 'remind-block is-none' }, [
+        el('span', { class: 'rb-badge', text: '提醒' }),
+        el('span', { class: 'rb-main', text: '未设置提醒' }),
+        el('span', { class: 'rb-hint', text: '按「编辑」可以为这条待办设一个到点通知（可提前、可重复）' }),
+      ]);
+    }
+
+    const state = model.reminderState(reminder, now);
+    const repeat = reminder.repeat === 'none' ? '' : ' · ' + model.reminderRepeatText(reminder);
+    const advance = reminder.advance ? ' · ' + model.reminderAdvanceText(reminder) : '';
+
+    return el('div', { class: 'remind-block is-' + state.key }, [
+      el('span', { class: 'rb-badge', text: '提醒' }),
+      // 原定的提醒时间始终显示（结束的提醒也保留"当初定的是几点"）
+      el('span', { class: 'rb-main', text: model.reminderTiming(reminder, now) + advance + repeat }),
+      el('span', {
+        class: 'rb-state',
+        text: state.label + (state.detail ? ' · ' + state.detail : ''),
+      }),
+      el('span', {
+        class: 'rb-hint',
+        text: reminder.lastFiredAt
+          ? '最近提醒：' + model.absoluteTime(reminder.lastFiredAt) +
+            (reminder.firedCount > 1 ? '（累计 ' + reminder.firedCount + ' 次）' : '')
+          : '尚未提醒过',
+      }),
     ]);
   }
   /* ---------------------------------------------------------- 渲染：表单面板 */
@@ -527,6 +605,98 @@
       ]),
       control,
       error ? el('span', { class: 'field-error', text: error }) : null,
+    ]);
+  }
+
+  /** 下拉：keys + 文案表 → <select>（表单里的提醒选项用它，避免三处重复） */
+  function selectField(id, field, value, keys, labels, extraClass) {
+    return el('select', {
+      id: id, class: 'input select' + (extraClass ? ' ' + extraClass : ''),
+      dataset: { field: field },
+    }, keys.map(function (key) {
+      return el('option', {
+        value: String(key),
+        selected: String(value) === String(key) ? 'selected' : null,
+      }, [labels[key]]);
+    }));
+  }
+
+  /** 表单里那行"到点提醒：…"的确认文案（视图层与控制器共用同一份计算） */
+  function reminderPreviewText(values) {
+    const r = (values && values.reminder) || model.reminderForm(null);
+    const at = model.fromLocalInput(r.atText || r.defaultAtText);
+    if (at == null) return '选择提醒时间后，这里会显示确认文案';
+    return '到点提醒：' + model.reminderSummary({
+      enabled: true, at: at, advance: r.advance, repeat: r.repeat,
+      endType: r.endType, endCount: r.endCount,
+      endDate: model.fromLocalInput(String(r.endDateText || '') + 'T23:59') || null,
+    }, Date.now());
+  }
+
+  /** 提醒字段组：开关 + 时间 + 提前量 + 重复 + 结束条件 + 完成后处置 + 确认文案 */
+  function reminderFields(values, errors) {
+    const r = values.reminder || model.reminderForm(null);
+    const on = !!r.enabled;
+    const atText = r.atText || r.defaultAtText;
+    const preview = reminderPreviewText(values);
+
+    return el('div', {
+      class: 'field reminder-field' + ((errors.reminderAt || errors.reminderEnd) ? ' has-error' : ''),
+    }, [
+      el('label', { class: 'field-label', for: 'f-remind-on' }, [
+        el('span', { text: '提醒' }),
+        el('span', { class: 'counter', text: on ? '到点由系统通知提醒' : '可选 · 默认关闭' }),
+      ]),
+      el('label', { class: 'switch' }, [
+        el('input', {
+          type: 'checkbox', id: 'f-remind-on', dataset: { field: 'reminderEnabled' },
+          checked: on ? 'checked' : null,
+        }),
+        el('span', { class: 'switch-track', 'aria-hidden': 'true' }),
+        el('span', { class: 'switch-label', text: on ? '已开启提醒' : '开启提醒' }),
+      ]),
+      on ? el('div', { class: 'reminder-controls' }, [
+        el('div', { class: 'reminder-row' }, [
+          el('label', { class: 'sub-label', for: 'f-remind-at', text: '提醒时间' }),
+          el('input', {
+            id: 'f-remind-at', class: 'input', type: 'datetime-local',
+            dataset: { field: 'reminderAt' }, value: atText,
+          }),
+        ]),
+        el('div', { class: 'reminder-row' }, [
+          el('label', { class: 'sub-label', for: 'f-remind-advance', text: '提前提醒' }),
+          selectField('f-remind-advance', 'reminderAdvance', r.advance,
+            model.REMINDER_ADVANCES, model.REMINDER_ADVANCE_LABEL),
+        ]),
+        el('div', { class: 'reminder-row' }, [
+          el('label', { class: 'sub-label', for: 'f-remind-repeat', text: '重复' }),
+          selectField('f-remind-repeat', 'reminderRepeat', r.repeat,
+            model.REMINDER_REPEATS, model.REMINDER_REPEAT_LABEL),
+        ]),
+        r.repeat !== 'none' ? el('div', { class: 'reminder-row' }, [
+          el('label', { class: 'sub-label', for: 'f-remind-end', text: '结束条件' }),
+          selectField('f-remind-end', 'reminderEndType', r.endType,
+            model.REMINDER_ENDS, model.REMINDER_END_LABEL),
+          r.endType === 'count' ? el('input', {
+            id: 'f-remind-count', class: 'input tiny', type: 'number', min: '1',
+            max: String(model.REMINDER_LIMIT.count), value: String(r.endCount || 5),
+            dataset: { field: 'reminderEndCount' }, 'aria-label': '重复总次数',
+            placeholder: '次数',
+          }) : null,
+          r.endType === 'date' ? el('input', {
+            id: 'f-remind-date', class: 'input', type: 'date', value: r.endDateText || '',
+            dataset: { field: 'reminderEndDate' }, 'aria-label': '截止日期',
+          }) : null,
+        ]) : null,
+        el('div', { class: 'reminder-row' }, [
+          el('label', { class: 'sub-label', for: 'f-remind-done', text: '完成后' }),
+          selectField('f-remind-done', 'reminderOnDone', r.onDone,
+            model.REMINDER_ON_DONE, model.REMINDER_ON_DONE_LABEL),
+        ]),
+        el('p', { class: 'reminder-preview', id: 'reminder-preview', text: preview }),
+      ]) : null,
+      errors.reminderAt ? el('span', { class: 'field-error', text: errors.reminderAt }) : null,
+      errors.reminderEnd ? el('span', { class: 'field-error', text: errors.reminderEnd }) : null,
     ]);
   }
 
@@ -588,6 +758,8 @@
           });
         })),
       ]),
+
+      reminderFields(values, errors),
 
       field('f-note', '备注（可选）', el('textarea', {
         id: 'f-note', class: 'input textarea', rows: '5', spellcheck: 'false',
@@ -709,6 +881,157 @@
     ]);
   }
 
+  /* -------------------------------------------------------- 渲染：通知设置 */
+
+  const PERMISSION_TEXT = {
+    granted: { label: '已授权', tone: 'ok', hint: '到点后会出现在系统通知中心（横幅或通知列表，取决于系统设置）。' },
+    denied: { label: '已被拒绝', tone: 'danger', hint: '系统设置 → 通知 → 「待办中心 · TODO Studio」里重新打开允许通知，再回到这里点「重新检查」。' },
+    undetermined: { label: '尚未授权', tone: 'warn', hint: '点下面的「请求通知权限」，系统会弹一次授权框；允许之后才会有横幅。' },
+    unsupported: { label: '当前环境不支持', tone: 'muted', hint: '浏览器预览模式下没有系统通知；应用内提示仍然可用。' },
+    unknown: { label: '未取到状态', tone: 'muted', hint: '后端还没就绪，稍后点「重新检查」。' },
+  };
+
+  /** 设置行里的开关：它是动作按钮（点击切换），所以用 button + aria-pressed */
+  function switchButton(act, label, checked, hint) {
+    return el('button', {
+      class: 'switch is-button' + (checked ? ' is-on' : ''),
+      dataset: { act: act }, 'aria-pressed': checked ? 'true' : 'false',
+      title: hint || label,
+    }, [
+      el('span', { class: 'switch-track', 'aria-hidden': 'true' }),
+      el('span', { class: 'switch-label', text: label }),
+    ]);
+  }
+
+  function settingRow(title, hint, control) {
+    return el('div', { class: 'setting-row' }, [
+      el('div', { class: 'setting-text' }, [
+        el('span', { class: 'setting-title', text: title }),
+        el('span', { class: 'setting-hint', text: hint }),
+      ]),
+      control,
+    ]);
+  }
+
+  /** 权限状态卡：先给状态，再给"下一步做什么" */
+  function permissionCard(view) {
+    const permission = PERMISSION_TEXT[view.permission && view.permission.state] || PERMISSION_TEXT.unknown;
+    const state = view.permission ? view.permission.state : 'unknown';
+
+    return el('div', { class: 'perm-card is-' + permission.tone, id: 'perm-card' }, [
+      el('div', { class: 'perm-head' }, [
+        el('span', { class: 'perm-dot', 'aria-hidden': 'true' }),
+        el('span', { class: 'perm-label', id: 'perm-label', text: '通知权限：' + permission.label }),
+      ]),
+      el('p', { class: 'perm-hint', id: 'perm-hint', text: permission.hint }),
+      el('div', { class: 'perm-actions' }, [
+        state === 'undetermined'
+          ? el('button', { class: 'btn primary sm', dataset: { act: 'request-permission' }, text: '请求通知权限' })
+          : null,
+        state === 'denied'
+          ? el('button', {
+              class: 'btn sm', dataset: { act: 'open-notification-settings' },
+              title: '让系统把「通知」设置页调到前台', text: '打开系统通知设置',
+            })
+          : null,
+        el('button', { class: 'btn ghost sm', dataset: { act: 'check-permission' }, text: '重新检查' }),
+        el('button', {
+          class: 'btn sm', dataset: { act: 'notify-test' },
+          title: '立即发一条测试通知（绕过免打扰与总开关）', text: '发送测试通知',
+        }),
+      ]),
+    ]);
+  }
+
+  function renderSettingsPanel(view) {
+    const notify = view.notifications;
+    const stats = view.reminderStats || { total: 0, active: 0, due: 0, soon: 0, pending: 0 };
+    const login = view.loginItem;   // true | false | null（读不到）
+
+    return el('div', { class: 'panel-card settings-panel', id: 'panel-settings' }, [
+      el('div', { class: 'panel-title-row' }, [
+        el('h2', { class: 'panel-title', text: '通知设置' }),
+        el('span', { class: 'muted-note', text: '改动即时保存，重启仍然有效' }),
+      ]),
+
+      permissionCard(view),
+
+      el('div', { class: 'settings-group' }, [
+        settingRow('系统通知', '关掉后不再弹系统横幅，应用内提示照旧',
+          switchButton('toggle-notify', notify.enabled ? '已开启' : '已关闭', notify.enabled)),
+        settingRow('提示音', '系统通知带提示音',
+          switchButton('toggle-sound', notify.sound ? '有声' : '静音', notify.sound)),
+        settingRow('免打扰时段', '时段内不弹横幅，应用内仍会记录到点的提醒',
+          switchButton('toggle-dnd', notify.dndEnabled ? '已开启' : '已关闭', notify.dndEnabled)),
+        notify.dndEnabled
+          ? el('div', { class: 'dnd-row' }, [
+              el('span', { class: 'sub-label', text: '从' }),
+              el('input', {
+                class: 'input time', type: 'time', value: notify.dndFrom,
+                dataset: { field: 'notifyDndFrom' }, 'aria-label': '免打扰开始时间',
+              }),
+              el('span', { class: 'sub-label', text: '到' }),
+              el('input', {
+                class: 'input time', type: 'time', value: notify.dndTo,
+                dataset: { field: 'notifyDndTo' }, 'aria-label': '免打扰结束时间',
+              }),
+              el('span', { class: 'setting-hint', text: '支持跨零点，例如 22:00 到 08:00' }),
+            ])
+          : null,
+        settingRow('错过的提醒补发', '应用没运行时到点的提醒，下次打开立刻补一条',
+          switchButton('toggle-catchup', notify.catchUp ? '已开启' : '已关闭', notify.catchUp)),
+        settingRow('登录时自动启动', '让应用常驻，"应用没打开"也能按时提醒',
+          switchButton('toggle-autostart',
+            login === true ? '已开启' : (login === false ? '已关闭' : '未知'),
+            login === true,
+            login == null ? '当前环境读不到自动启动状态' : '跟随系统登录项设置')),
+      ]),
+
+      el('div', { class: 'settings-group notes' }, [
+        el('h4', { text: '当前提醒' }),
+        el('ul', { class: 'setting-list' }, [
+          el('li', { text: '已设置提醒 ' + stats.total + ' 条：活跃 ' + stats.active +
+            ' · 已到点 ' + stats.due + ' · 即将到期 ' + stats.soon }),
+          el('li', { text: stats.pending
+            ? '有 ' + stats.pending + ' 条到点但还没送出的提醒，下一次检查会补发'
+            : '没有待补发的提醒' }),
+        ]),
+        el('h4', { text: '通知机制与边界' }),
+        el('ul', { class: 'setting-list' }, [
+          el('li', { text: '提醒由后端（txiki.js）定时器守着：窗口最小化、被遮挡、甚至关掉窗口，到点都会弹系统通知。' }),
+          el('li', { text: '打包成 .app 运行时是系统"通知中心"的原生横幅（带应用图标、可点击跳转）；tinyjs dev 下 macOS 回落成 osascript，横幅来源显示为「脚本编辑器」。' }),
+          el('li', { text: '应用完全退出后没有进程能弹通知：这类"错过的提醒"会在下次打开时补发一条，并在列表里标成「已过期」。' }),
+          el('li', { text: '重复提醒（每天 / 每周 / 工作日）由后端推进周期；次数或截止日期用完后自动结束。' }),
+        ]),
+      ]),
+    ]);
+  }
+
+  /** 左栏头部的到点提示：一次性指路（去处理最近到点的那条） */
+  function renderRemindBanner(view) {
+    const box = refs['remind-banner'];
+    const queue = view.reminderQueue || [];
+    const stats = view.reminderStats || { soon: 0 };
+    const show = queue.length > 0 && !view.dueDismissed;
+
+    box.hidden = !show;
+    clear(box);
+    if (!show) return;
+
+    box.appendChild(el('span', { class: 'rb-icon', text: '⏰', 'aria-hidden': 'true' }));
+    box.appendChild(el('span', {
+      class: 'rb-text',
+      text: '有 ' + queue.length + ' 条提醒到点' + (stats.soon ? '，另有 ' + stats.soon + ' 条即将到期' : ''),
+    }));
+    box.appendChild(el('button', {
+      class: 'btn sm', dataset: { act: 'remind-open', id: queue[0].id },
+      title: '跳到「' + queue[0].title + '」并高亮', text: '查看最近一条',
+    }));
+    box.appendChild(el('button', {
+      class: 'btn ghost sm', dataset: { act: 'remind-dismiss' }, text: '知道了',
+    }));
+  }
+
   /* ---------------------------------------------------------- 渲染：草稿提示 */
 
   function renderBanner(view) {
@@ -787,6 +1110,7 @@
     renderList(view);
     renderTabs(view);
     renderBanner(view);
+    renderRemindBanner(view);
 
     const body = refs['panel-content'];
     const active = doc.activeElement;
@@ -797,6 +1121,7 @@
     if (view.mode === 'add' || view.mode === 'edit') body.appendChild(renderFormPanel(view));
     else if (view.mode === 'delete') body.appendChild(renderDeletePanel(view));
     else if (view.mode === 'categories') body.appendChild(renderCategoriesPanel(view));
+    else if (view.mode === 'settings') body.appendChild(renderSettingsPanel(view));
     else body.appendChild(renderViewPanel(view));
 
     if (fieldName) {
@@ -833,6 +1158,9 @@
     renderViewPanel: renderViewPanel, renderFormPanel: renderFormPanel, renderDeletePanel: renderDeletePanel,
     renderCategoryGroup: renderCategoryGroup, renderFocusChip: renderFocusChip,
     renderCategoriesPanel: renderCategoriesPanel,
+    renderSettingsPanel: renderSettingsPanel, renderRemindBanner: renderRemindBanner,
+    renderReminderBlock: renderReminderBlock, reminderFields: reminderFields, selectField: selectField,
+    reminderPreviewText: reminderPreviewText,
     renderBanner: renderBanner, renderStoreState: renderStoreState, renderEnv: renderEnv,
     toast: toast, render: render, focusField: focusField, shake: shake,
   };

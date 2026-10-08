@@ -16,10 +16,11 @@
 
   /** 存储键：带版本后缀，将来结构升级可并存 / 迁移 */
   const KEYS = {
-    items: 'todo.items.v1',        // Todo[]（每条带 categoryId）
+    items: 'todo.items.v1',        // Todo[]（每条带 categoryId 与可选的 reminder）
     categories: 'todo.categories.v1', // Category[]：{ id, name, color, builtin, createdAt }
     ui: 'todo.ui.v1',              // { themeMode, listCollapsed, collapsedCategories,
                                    //   focusCategoryId, expanded, filter, selectedId, lastCategoryId }
+    settings: 'todo.settings.v1',  // { notifications: { enabled, sound, dndEnabled, dndFrom, dndTo, catchUp } }
   };
 
   /** 内存驱动器：浏览器预览 / 单测 / tiny 不可用时使用 */
@@ -110,11 +111,21 @@
       async saveUi(ui) {
         return write(KEYS.ui, ui);
       },
+      /** 通知设置：读不到就返回默认值（model.DEFAULT_NOTIFICATIONS） */
+      async loadSettings() {
+        const raw = await read(KEYS.settings, null);
+        const source = raw && typeof raw === 'object' ? raw : {};
+        return { notifications: NS.model.sanitizeNotifications(source.notifications) };
+      },
+      async saveSettings(settings) {
+        return write(KEYS.settings, settings);
+      },
       async clearAll() {
         try {
           await driver.remove(KEYS.items);
           await driver.remove(KEYS.categories);
           await driver.remove(KEYS.ui);
+          await driver.remove(KEYS.settings);
           lastError = null;
           report('saved');
           return true;
