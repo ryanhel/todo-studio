@@ -89,6 +89,10 @@
   --warn-bg: rgba(251, 191, 36, .1);
   --warn-soft: rgba(251, 191, 36, .14);
   --warn-line: rgba(251, 191, 36, .4);
+  /* 「已提醒」= 实心琥珀（已经发生，等你处理）：填充更实、字色更深，和"空心琥珀"的"即将到期"区分开 */
+  --fired-bg: rgba(251, 191, 36, .58);
+  --fired-line: rgba(251, 191, 36, .78);
+  --fired-ink: #241703;
   --warn-text: #fde68a;
 
   --danger: #f87171;
@@ -201,6 +205,10 @@
   --warn-soft: rgba(217, 119, 6, .12);
   --warn-line: rgba(217, 119, 6, .32);
   --warn-text: #8a5300;
+  /* 「已提醒」实心琥珀（浅色板：淡填充 + 深琥珀字） */
+  --fired-bg: rgba(217, 119, 6, .22);
+  --fired-line: rgba(217, 119, 6, .5);
+  --fired-ink: #7a3d00;
 
   --danger: #dc2626;
   --danger-soft: rgba(220, 38, 38, .1);
@@ -301,6 +309,10 @@
   --warn-soft: rgba(217, 119, 6, .12);
   --warn-line: rgba(217, 119, 6, .32);
   --warn-text: #8a5300;
+  /* 「已提醒」实心琥珀（浅色板：淡填充 + 深琥珀字） */
+  --fired-bg: rgba(217, 119, 6, .22);
+  --fired-line: rgba(217, 119, 6, .5);
+  --fired-ink: #7a3d00;
 
   --danger: #dc2626;
   --danger-soft: rgba(220, 38, 38, .1);
@@ -966,9 +978,13 @@ input, textarea { font: inherit; color: inherit; }
   border-radius: var(--radius-pill);
 }
 .remind-chip.is-scheduled { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); }
+/* 即将到期：空心琥珀（还没发生，只是快了） */
 .remind-chip.is-soon { color: var(--text); background: var(--warn-soft); border-color: var(--warn-line); }
-/* 已提醒：确实弹过，等处理（琥珀） */
-.remind-chip.is-fired { color: var(--text); background: var(--warn-soft); border-color: var(--warn-line); }
+/* 已提醒：实心琥珀 + 加粗（已经发生，等你处理）—— 与"即将到期"一眼分得开 */
+.remind-chip.is-fired {
+  color: var(--fired-ink); font-weight: 600;
+  background: var(--fired-bg); border-color: var(--fired-line);
+}
 /* 已过期：到点但没送出去（红） */
 .remind-chip.is-missed { color: var(--danger-text); background: var(--danger-soft); border-color: var(--danger-line); }
 /* 已结束 / 重复已结束：正常收尾，不是"被取消"（灰，无删除线） */
@@ -976,11 +992,11 @@ input, textarea { font: inherit; color: inherit; }
 /* 已取消：用户手动关掉（灰 + 删除线） */
 .remind-chip.is-off { opacity: .65; text-decoration: line-through; }
 
-/* 刚触发提醒的条目：呼吸式高亮几秒（控制器超时后清掉 highlightId） */
+/* 刚触发提醒的条目：左侧亮条 + 琥珀描边持续到高亮结束，配合三次呼吸做"点名"感 */
 .item.is-reminding {
   border-color: var(--warn-line);
-  box-shadow: inset 3px 0 0 var(--warn-line), var(--shadow-soft);
-  animation: remind-pulse 1.4s ease 4;
+  box-shadow: inset 4px 0 0 var(--warn-line), 0 0 0 1px var(--warn-line), var(--shadow-soft);
+  animation: remind-pulse 1.2s ease 3;
 }
 @keyframes remind-pulse {
   0%, 100% { background: var(--item-bg); }
@@ -997,7 +1013,8 @@ input, textarea { font: inherit; color: inherit; }
   border-radius: var(--radius-sm);
 }
 .remind-block.is-scheduled { background: var(--accent-soft); border-color: var(--accent-line); }
-.remind-block.is-soon, .remind-block.is-fired { background: var(--warn-soft); border-color: var(--warn-line); }
+.remind-block.is-soon { background: var(--warn-soft); border-color: var(--warn-line); }
+.remind-block.is-fired { background: var(--fired-bg); border-color: var(--fired-line); }
 .remind-block.is-missed { background: var(--danger-soft); border-color: var(--danger-line); }
 .remind-block.is-done, .remind-block.is-ended, .remind-block.is-off { opacity: .85; }
 .rb-badge {
